@@ -273,14 +273,13 @@ static void scan_windows(struct packed_git *p,
 
 static int unuse_one_window(struct object_database *odb)
 {
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(odb->source);
 	struct packfile_list_entry *e;
 	struct packed_git *lru_p = NULL;
 	struct pack_window *lru_w = NULL, *lru_l = NULL;
 
-	for (source = odb->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		for (e = files->packed->packs.head; e; e = e->next)
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		for (e = dir->packed->packs.head; e; e = e->next)
 			scan_windows(e->pack, &lru_p, &lru_w, &lru_l);
 	}
 
@@ -353,16 +352,6 @@ static void close_pack_mtimes(struct packed_git *p)
 
 	munmap((void *)p->mtimes_map, p->mtimes_size);
 	p->mtimes_map = NULL;
-}
-
-void close_pack(struct packed_git *p)
-{
-	close_pack_windows(p);
-	close_pack_fd(p);
-	close_pack_index(p);
-	close_pack_revindex(p);
-	close_pack_mtimes(p);
-	oidset_clear(&p->bad_objects);
 }
 
 void unlink_pack_path(const char *pack_name, int force_delete)
@@ -450,15 +439,14 @@ static void find_lru_pack(struct packed_git *p, struct packed_git **lru_p, struc
 
 static int close_one_pack(struct repository *r)
 {
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 	struct packfile_list_entry *e;
 	struct packed_git *lru_p = NULL;
 	struct pack_window *mru_w = NULL;
 	int accept_windows_inuse = 1;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		for (e = files->packed->packs.head; e; e = e->next) {
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		for (e = dir->packed->packs.head; e; e = e->next) {
 			if (e->pack->pack_fd == -1)
 				continue;
 			find_lru_pack(e->pack, &lru_p, &mru_w, &accept_windows_inuse);
@@ -1263,6 +1251,29 @@ void clear_delta_base_cache(void)
 	}
 }
 
+static void delta_base_cache_evict_entry(struct packed_git *p)
+{
+	struct list_head *lru, *tmp;
+
+	list_for_each_safe(lru, tmp, &delta_base_cache_lru) {
+		struct delta_base_cache_entry *entry =
+			list_entry(lru, struct delta_base_cache_entry, lru);
+		if (entry->key.p == p)
+			release_delta_base_cache(entry);
+	}
+}
+
+void close_pack(struct packed_git *p)
+{
+	close_pack_windows(p);
+	close_pack_fd(p);
+	close_pack_index(p);
+	close_pack_revindex(p);
+	close_pack_mtimes(p);
+	oidset_clear(&p->bad_objects);
+	delta_base_cache_evict_entry(p);
+}
+
 static void add_delta_base_cache(struct packed_git *p, off_t base_offset,
 				 void *base, size_t base_size,
 				 size_t delta_base_cache_limit,
@@ -1921,11 +1932,10 @@ struct packed_git **packfile_store_get_kept_pack_cache(struct odb_source_packed 
 
 int has_object_pack(struct repository *r, const struct object_id *oid)
 {
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		if (!odb_source_read_object_info(&files->packed->base, oid, NULL, 0, NULL))
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		if (!odb_source_read_object_info(&dir->packed->base, oid, NULL, 0, NULL))
 			return 1;
 	}
 
@@ -1935,14 +1945,13 @@ int has_object_pack(struct repository *r, const struct object_id *oid)
 int has_object_kept_pack(struct repository *r, const struct object_id *oid,
 			 unsigned flags)
 {
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 	struct pack_entry e;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
 		struct packed_git **cache;
 
-		cache = packfile_store_get_kept_pack_cache(files->packed, flags);
+		cache = packfile_store_get_kept_pack_cache(dir->packed, flags);
 
 		for (; *cache; cache++) {
 			struct packed_git *p = *cache;

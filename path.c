@@ -396,7 +396,7 @@ static void adjust_git_path(struct repository *repo,
 		strbuf_splice(buf, 0, buf->len,
 			      repo->index_file, strlen(repo->index_file));
 	else if (dir_prefix(base, "objects"))
-		replace_dir(buf, git_dir_len + 7, repo->objects->sources->path);
+		replace_dir(buf, git_dir_len + 7, repo->objects->source->path);
 	else if (repo_settings_get_hooks_path(repo) && dir_prefix(base, "hooks"))
 		replace_dir(buf, git_dir_len + 5, repo_settings_get_hooks_path(repo));
 	else if (repo->different_commondir)
@@ -829,8 +829,8 @@ int safe_create_dir_in_gitdir(struct repository *repo, const char *path)
 	return adjust_shared_perm(repo, path);
 }
 
-static enum scld_error safe_create_leading_directories_1(struct repository *repo,
-							 char *path)
+enum scld_error safe_create_leading_directories(struct repository *repo,
+						char *path)
 {
 	char *next_component = path + offset_1st_component(path);
 	enum scld_error ret = SCLD_OK;
@@ -884,15 +884,14 @@ static enum scld_error safe_create_leading_directories_1(struct repository *repo
 	return ret;
 }
 
-enum scld_error safe_create_leading_directories(struct repository *repo,
-						char *path)
-{
-	return safe_create_leading_directories_1(repo, path);
-}
-
 enum scld_error safe_create_leading_directories_no_share(char *path)
 {
-	return safe_create_leading_directories_1(NULL, path);
+	return safe_create_leading_directories(NULL, path);
+}
+
+enum scld_error safe_create_leading_directories_no_share_const(const char *path)
+{
+	return safe_create_leading_directories_const(NULL, path);
 }
 
 enum scld_error safe_create_leading_directories_const(struct repository *repo,
@@ -1655,3 +1654,4 @@ REPO_GIT_PATH_FUNC(merge_mode, "MERGE_MODE")
 REPO_GIT_PATH_FUNC(merge_head, "MERGE_HEAD")
 REPO_GIT_PATH_FUNC(fetch_head, "FETCH_HEAD")
 REPO_GIT_PATH_FUNC(shallow, "shallow")
+REPO_GIT_PATH_FUNC(merge_labels, "MERGE_LABELS")

@@ -5177,6 +5177,7 @@ static int pick_commits(struct repository *r,
 	unlink(rebase_path_stopped_sha());
 	unlink(rebase_path_amend());
 	unlink(rebase_path_patch());
+	unlink(git_path_merge_labels(r));
 
 	while (todo_list->current < todo_list->nr) {
 		struct todo_item *item = todo_list->items + todo_list->current;
@@ -6617,11 +6618,11 @@ static int add_decorations_to_list(const struct commit *commit,
 				   struct todo_add_branch_context *ctx)
 {
 	const struct name_decoration *decoration = get_name_decoration(&commit->object);
-	const char *head_ref = refs_resolve_ref_unsafe(get_main_ref_store(the_repository),
-						       "HEAD",
-						       RESOLVE_REF_READING,
-						       NULL,
-						       NULL);
+	char *head_ref = refs_resolve_refdup(get_main_ref_store(the_repository),
+					     "HEAD",
+					     RESOLVE_REF_READING,
+					     NULL,
+					     NULL);
 
 	while (decoration) {
 		struct todo_item *item;
@@ -6673,6 +6674,7 @@ static int add_decorations_to_list(const struct commit *commit,
 		decoration = decoration->next;
 	}
 
+	free(head_ref);
 	return 0;
 }
 
