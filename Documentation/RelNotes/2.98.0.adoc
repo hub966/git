@@ -94,6 +94,25 @@ UI, Workflows & Features
    the system's hostname as seen by Git can now be queried using 'git
    var GIT_HOSTNAME'.
 
+ * The hint printed when tracking configuration fails to be written has
+   been corrected to produce a valid remote-tracking branch name.
+
+ * The 'git switch' and 'git checkout' commands have been updated to
+   complete the branch switch instead of aborting when the tracking
+   configuration fails to write, matching the behavior of 'git push -u'.
+
+ * The hook.<event>.enabled configuration variable has been extended to
+   also disable traditional hookdir hooks in addition to configured
+   hooks.  In addition, the hook configuration parser has been updated
+   to treat missing values for boolean variables like enabled and
+   parallel as true.
+
+ * The advice subsystem has been updated to suggest using the
+   '--global' option when recommending a command snippet to squelch
+   future advice messages, since global configuration is generally
+   more appropriate for user-level preferences than per-repository
+   settings.
+
 
 Performance, Internal Implementation, Development Support etc.
 --------------------------------------------------------------
@@ -218,6 +237,54 @@ Performance, Internal Implementation, Development Support etc.
    revs_copy structure at declaration. This prevents a potential crash
    caused by reading uninitialized stack memory during cleanup when an
    unrecognized argument is provided.
+
+ * The macOS CI jobs have been updated to use a mixture of 'macos-15' and
+   'macos-latest' images, as the 'macos-14' hosted runner image is being
+   deprecated by GitHub.
+
+ * The test in 't5301' has been modernized to use the
+   'test_path_is_file' helper instead of the raw 'test -f' command.
+
+ * The Makefile has been updated to explicitly pass '--target-dir
+   target' to 'cargo' when building the 'gitcore' library, fixing a
+   link error that occurs when the user has a custom target directory
+   configured via 'CARGO_TARGET_DIR' or their Cargo configuration.
+
+ * A test script ('t2104') has been updated to avoid piping the output of
+   a 'git' command into another command, which would hide its exit code.
+
+ * The creation of '.keep' lockfiles during object database
+   transactions has been deferred to commit time, explicitly managing
+   the lockfiles within the files backend rather than relying on
+   'git-index-pack', to prevent race conditions that could lead to
+   concurrent lockfiles being erroneously deleted.
+
+ * The connectivity check in 'git fetch' and 'git receive-pack' has
+   been optimized with an alternative incremental mode, available via
+   'transfer.connectivityCheck=incremental'.  Instead of walking the
+   full object closure of the boundary commits, it compares the trees
+   of incoming commits against their trusted parent trees, skipping
+   unchanged subtrees.
+
+ * The verbose "Checking connectivity" message in 'git fsck' has been
+   updated to use the pluralizing translation macro.
+
+ * The messages 'git checkout' prints to describe orphaned commits and
+   multiple references have been updated to use the Q_() macro, allowing
+   translators to use the correct plural forms for numbers greater than
+   one.
+
+ * The 'rerere' subsystem has been libified to remove its dependency on
+   the global 'the_repository' state and global tracking variables,
+   allowing it to operate correctly in multi-repository contexts.
+
+ * The test script 't0081-find-pack.sh' has been updated to use the
+   'test_path_is_file' helper instead of the raw 'test -f' command.
+
+ * The documentation on contributing has been updated to emphasize the
+   importance of discussing review feedback before sending the next
+   iteration, and the section on sending an updated version has been
+   moved to appear after the discussion of the review process.
 
 
 Fixes since v2.56
@@ -400,6 +467,12 @@ Fixes since v2.56
    32-bit positive signed integer limit, avoiding integer wraparound
    for dates past the year 2038.
    (merge 24e00cde86 rs/archive-zip-omit-out-of-range-mtime later to maint).
+
+ * The loose refs cache in the files backend has been updated to avoid
+   caching root refs (like 'HEAD'), preventing them from being omitted
+   from subsequent iterators that explicitly request them when a
+   previous iterator populated the cache without them.
+   (merge 7f4e8cd956 ak/refs-files-root-refs-cache later to maint).
 
  * Other code cleanup, docfix, build fix, etc.
    (merge e638de60bc kz/doc-add-rm-typofix later to maint).
