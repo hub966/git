@@ -133,7 +133,7 @@ int update_path_in_gitmodules(const char *oldpath, const char *newpath)
 	strbuf_addstr(&entry, "submodule.");
 	strbuf_addstr(&entry, submodule->name);
 	strbuf_addstr(&entry, ".path");
-	ret = config_set_in_gitmodules_file_gently(entry.buf, newpath);
+	ret = config_set_in_gitmodules_file_gently(the_repository, entry.buf, newpath);
 	strbuf_release(&entry);
 	return ret;
 }
@@ -2390,7 +2390,7 @@ static int validate_submodule_encoded_git_dir(char *git_dir, const char *submodu
 
 	/* Prevent conflicts on case-folding filesystems */
 	repo_config_get_bool(the_repository, "core.ignorecase", &config_ignorecase);
-	if (ignore_case || config_ignorecase) {
+	if (repo_ignore_case(the_repository) || config_ignorecase) {
 		bool suffixes_match = !strcmp(last_submodule_name, submodule_name);
 		return check_casefolding_conflict(git_dir, submodule_name,
 						  suffixes_match);
@@ -2494,7 +2494,7 @@ static void relocate_single_git_dir_into_superproject(const char *path,
 	if (validate_submodule_path(path) < 0)
 		exit(128);
 
-	if (submodule_uses_worktrees(path))
+	if (submodule_uses_worktrees(the_repository, path))
 		die(_("relocate_gitdir for submodule '%s' with "
 		      "more than one worktree not supported"), path);
 

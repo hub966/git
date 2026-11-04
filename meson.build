@@ -161,6 +161,21 @@
 # These machine files can be passed to `meson setup` via the `--native-file`
 # option.
 #
+# Fuzzing
+# =======
+#
+# Meson supports building the fuzzing targets by setting `-Dfuzzers=true`. By
+# default, the targets will be built without libFuzzer and thus won't be usable
+# for fuzzing. You have to configure a couple of options to properly wire up
+# libFuzzer:
+#
+#   $ meson setup build-fuzzers \
+#       -Db_sanitize=address,fuzzer-no-link \
+#       -Dfuzzers=true \
+#       -Dfuzzers_link_args=-fsanitize=fuzzer
+#   $ meson compile -C build-fuzzers
+#   $ ./build-fuzzers/oss-fuzz/fuzz-config <args>
+#
 # Cross compilation
 # =================
 #
@@ -359,6 +374,7 @@ libgit_sources = [
   'ewah/ewah_rlw.c',
   'exec-cmd.c',
   'fetch-negotiator.c',
+  'fetch-object-info.c',
   'fetch-pack.c',
   'fmt-merge-msg.c',
   'fsck.c',
@@ -546,6 +562,7 @@ libgit_sources = [
   'transport-helper.c',
   'transport.c',
   'tree-diff.c',
+  'tree-verify.c',
   'tree-walk.c',
   'tree.c',
   'unpack-trees.c',
@@ -1302,7 +1319,6 @@ elif host_machine.system() == 'windows'
 
   libgit_c_args += [
     '-DDETECT_MSYS_TTY',
-    '-DENSURE_MSYSTEM_IS_SET',
     '-DNATIVE_CRLF',
     '-DNOGDI',
     '-DNO_POSIX_GOODIES',
@@ -1311,6 +1327,20 @@ elif host_machine.system() == 'windows'
     '-D_CONSOLE_DETECT_MSYS_TTY',
     '-D__USE_MINGW_ANSI_STDIO=0',
   ]
+
+  msystem = get_option('msystem')
+  if msystem != ''
+    mingw_prefix = get_option('mingw_prefix')
+    if mingw_prefix == ''
+      mingw_prefix = msystem.to_lower()
+    elif mingw_prefix.startswith('/')
+      mingw_prefix = mingw_prefix.substring(1)
+    endif
+    libgit_c_args += [
+      '-DENSURE_MSYSTEM_IS_SET="' + msystem + '"',
+      '-DMINGW_PREFIX="' + mingw_prefix + '"'
+    ]
+  endif
 
   libgit_dependencies += compiler.find_library('ntdll')
   libgit_include_directories += 'compat/win32'
@@ -1448,6 +1478,7 @@ checkfuncs = {
   'initgroups' : [],
   'strtoumax' : ['strtoumax.c', 'strtoimax.c'],
   'pread' : ['pread.c'],
+  'writev' : ['writev.c'],
 }
 
 if host_machine.system() == 'windows'
@@ -1895,19 +1926,23 @@ bin_wrappers += executable('scalar',
 
 if curl.found()
   libgit_curl = declare_dependency(
-    sources: [
-      'http.c',
-      'http-walker.c',
-    ],
+    link_with: static_library('git-curl',
+      sources: [
+        'http.c',
+        'http-walker.c',
+      ],
+      dependencies: [libgit_commonmain, curl],
+    ),
     dependencies: [libgit_commonmain, curl],
   )
 
-  test_dependencies += executable('git-remote-http',
+  git_remote_http = executable('git-remote-http',
     sources: 'remote-curl.c',
     dependencies: [libgit_curl],
     install: true,
     install_dir: git_exec_path,
   )
+  test_dependencies += git_remote_http
 
   test_dependencies += executable('git-http-fetch',
     sources: 'http-fetch.c',
@@ -1927,7 +1962,7 @@ if curl.found()
 
   foreach alias : [ 'git-remote-https', 'git-remote-ftp', 'git-remote-ftps' ]
     test_dependencies += executable(alias,
-      sources: 'remote-curl.c',
+      objects: git_remote_http.extract_all_objects(recursive: false),
       dependencies: [libgit_curl],
     )
 

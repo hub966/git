@@ -75,11 +75,11 @@ sentinel_detector () {
 test_expect_success 'git hook usage' '
 	test_expect_code 129 git hook &&
 	test_expect_code 129 git hook run &&
-	test_expect_code 129 git hook run -h &&
+	git hook run -h &&
 	test_expect_code 129 git hook run --unknown 2>err &&
 	test_expect_code 129 git hook list &&
-	test_expect_code 129 git hook list -h &&
-	grep "unknown option" err
+	git hook list -h &&
+	test_grep "unknown option" err
 '
 
 test_expect_success 'git hook list: unknown hook name is rejected' '
@@ -361,9 +361,9 @@ test_expect_success 'hook can be configured for multiple events' '
 
 	# 'ghi' should be included in both 'pre-commit' and 'test-hook'
 	git hook list pre-commit >actual &&
-	grep "ghi" actual &&
+	test_grep "ghi" actual &&
 	git hook list --allow-unknown-hook-name test-hook >actual &&
-	grep "ghi" actual
+	test_grep "ghi" actual
 '
 
 test_expect_success 'git hook list shows hooks from the hookdir' '
@@ -496,6 +496,15 @@ test_expect_success 'disabled configured hook is not reported as existing by hoo
 	test_grep ! "pre-commit" git-bugreport-hook-exists-test.txt
 '
 
+test_expect_success 'event-disabled hookdir hook is not reported as existing by hook_exists' '
+	test_when_finished "rm -f git-bugreport-hook-exists-test.txt" &&
+	setup_hookdir &&
+	test_config hook.pre-commit.enabled false &&
+
+	git bugreport -s hook-exists-test &&
+	test_grep ! "pre-commit" git-bugreport-hook-exists-test.txt
+'
+
 test_expect_success 'globally disabled hook can be re-enabled locally' '
 	test_config_global hook.global-hook.event "test-hook" &&
 	test_config_global hook.global-hook.command "echo \"global-hook ran\"" &&
@@ -504,6 +513,17 @@ test_expect_success 'globally disabled hook can be re-enabled locally' '
 
 	echo "global-hook ran" >expected &&
 	git hook run --allow-unknown-hook-name test-hook 2>actual &&
+	test_cmp expected actual
+'
+
+test_expect_success 'hook.<friendly-name>.enabled without a value means true' '
+	test_config_global hook.global-hook.event "test-hook" &&
+	test_config_global hook.global-hook.command "echo \"global-hook ran\"" &&
+	test_config_global hook.global-hook.enabled false &&
+
+	echo "global-hook ran" >expected &&
+	git -c hook.global-hook.enabled \
+		hook run --allow-unknown-hook-name test-hook 2>actual &&
 	test_cmp expected actual
 '
 
@@ -569,7 +589,7 @@ test_expect_success 'git hook run a hook with a bad shebang' '
 	# TODO: We should emit the same (or at least a more similar)
 	# error on MINGW (essentially Git for Windows) and all other
 	# platforms.. See the OS-specific code in start_command()
-	grep -E "^(error|fatal): cannot (exec|spawn) .*bad-hooks/test-hook" err
+	test_grep -E "^(error|fatal): cannot (exec|spawn) .*bad-hooks/test-hook" err
 '
 
 test_expect_success 'stdin to hooks' '
@@ -826,8 +846,8 @@ test_expect_success 'git hook run -j2 warns for hooks not marked parallel=true' 
 	# neither hook has parallel=true
 
 	git hook run --allow-unknown-hook-name -j2 test-hook >out 2>err &&
-	grep "hook .hook-1. is not marked as parallel=true" err &&
-	grep "hook .hook-2. is not marked as parallel=true" err
+	test_grep "hook .hook-1. is not marked as parallel=true" err &&
+	test_grep "hook .hook-2. is not marked as parallel=true" err
 '
 
 test_expect_success 'hook.jobs=1 config runs hooks in series' '
@@ -1068,7 +1088,18 @@ test_expect_success 'hook.jobs=-1 resolves to online_cpus()' '
 	cpus=$(test-tool online-cpus) &&
 	GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
 		git hook run --allow-unknown-hook-name test-hook >out 2>err &&
-	grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
+	test_grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
+'
+
+test_expect_success 'hook.<friendly-name>.parallel without a value means true' '
+	test_config hook.hook-1.event test-hook &&
+	test_config hook.hook-1.command "true" &&
+	test_config hook.jobs 2 &&
+
+	GIT_TRACE2_EVENT="$(pwd)/trace-parallel.txt" \
+		git -c hook.hook-1.parallel \
+		hook run --allow-unknown-hook-name test-hook >out 2>err &&
+	test_grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:2\"" trace-parallel.txt
 '
 
 test_expect_success 'hook.<event>.jobs=-1 resolves to online_cpus()' '
@@ -1081,7 +1112,7 @@ test_expect_success 'hook.<event>.jobs=-1 resolves to online_cpus()' '
 	cpus=$(test-tool online-cpus) &&
 	GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
 		git hook run --allow-unknown-hook-name test-hook >out 2>err &&
-	grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
+	test_grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
 '
 
 test_expect_success 'git hook run -j-1 resolves to online_cpus()' '
@@ -1092,7 +1123,7 @@ test_expect_success 'git hook run -j-1 resolves to online_cpus()' '
 	cpus=$(test-tool online-cpus) &&
 	GIT_TRACE2_EVENT="$(pwd)/trace.txt" \
 		git hook run --allow-unknown-hook-name -j-1 test-hook >out 2>err &&
-	grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
+	test_grep "\"region_enter\".*\"hook\".*\"test-hook\".*\"max:$cpus\"" trace.txt
 '
 
 test_expect_success 'hook.jobs rejects values less than -1' '
@@ -1110,9 +1141,13 @@ test_expect_success 'hook.<event>.jobs rejects values less than -1' '
 test_expect_success 'hook.<event>.enabled=false skips all hooks for event' '
 	test_config hook.hook-1.event test-hook &&
 	test_config hook.hook-1.command "echo ran" &&
+	test_hook test-hook <<-\EOF &&
+	echo ran
+	EOF
 	test_config hook.test-hook.enabled false &&
 	git hook run --allow-unknown-hook-name test-hook >out 2>err &&
-	test_must_be_empty out
+	test_must_be_empty out &&
+	test_must_be_empty err
 '
 
 test_expect_success 'hook.<event>.enabled=true does not suppress hooks' '
@@ -1126,9 +1161,13 @@ test_expect_success 'hook.<event>.enabled=true does not suppress hooks' '
 test_expect_success 'hook.<event>.enabled=false does not affect other events' '
 	test_config hook.hook-1.event test-hook &&
 	test_config hook.hook-1.command "echo ran" &&
+	test_hook test-hook <<-\EOF &&
+	echo hookdir ran
+	EOF
 	test_config hook.other-event.enabled false &&
 	git hook run --allow-unknown-hook-name test-hook >out 2>err &&
-	test_grep "ran" err
+	test_grep "^ran$" err &&
+	test_grep "^hookdir ran$" err
 '
 
 test_expect_success 'hook.<friendly-name>.enabled=false still disables that hook' '
@@ -1147,10 +1186,14 @@ test_expect_success 'git hook list shows event-disabled hooks as event-disabled'
 	test_config hook.hook-1.command "echo ran" &&
 	test_config hook.hook-2.event test-hook &&
 	test_config hook.hook-2.command "echo ran" &&
+	test_hook test-hook <<-\EOF &&
+	echo ran
+	EOF
 	test_config hook.test-hook.enabled false &&
 	git hook list --allow-unknown-hook-name test-hook >actual &&
 	test_grep "^event-disabled	hook-1$" actual &&
-	test_grep "^event-disabled	hook-2$" actual
+	test_grep "^event-disabled	hook-2$" actual &&
+	test_grep "^event-disabled	hook from hookdir$" actual
 '
 
 test_expect_success 'git hook list shows scope with event-disabled' '
@@ -1167,6 +1210,14 @@ test_expect_success 'git hook list still shows hooks when event is disabled' '
 	test_config hook.test-hook.enabled false &&
 	git hook list --allow-unknown-hook-name test-hook >actual &&
 	test_grep "event-disabled" actual
+'
+
+test_expect_success 'commit skips the hookdir hook with hook.pre-commit.enabled=false' '
+	test_hook pre-commit <<-\EOF &&
+	exit 1
+	EOF
+	test_must_fail git commit --allow-empty -m blocked &&
+	git -c hook.pre-commit.enabled=false commit --allow-empty -m allowed
 '
 
 test_expect_success 'friendly-name matching known event name is rejected' '

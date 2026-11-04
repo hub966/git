@@ -142,6 +142,7 @@ const char *git_path_merge_mode(struct repository *r);
 const char *git_path_merge_head(struct repository *r);
 const char *git_path_fetch_head(struct repository *r);
 const char *git_path_shallow(struct repository *r);
+const char *git_path_merge_labels(struct repository *r);
 
 int ends_with_path_components(const char *path, const char *components);
 
@@ -234,14 +235,11 @@ int safe_create_dir_in_gitdir(struct repository *repo, const char *path);
  * race, callers might want to try invoking the function again when it
  * returns SCLD_VANISHED.
  *
- * safe_create_leading_directories() temporarily changes path while it
- * is working but restores it before returning.
- * safe_create_leading_directories_const() doesn't modify path, even
- * temporarily. Both these variants adjust the permissions of the
- * created directories to honor core.sharedRepository, so they are best
- * suited for files inside the git dir. For working tree files, use
- * safe_create_leading_directories_no_share() instead, as it ignores
- * the core.sharedRepository setting.
+ * The default variants honor "core.sharedRepository" and temporarily modify
+ * `path`. Note that this configuration should be honored for all files in the
+ * git directory. The `no_share()` variants ignore "core.sharedRepository",
+ * and should be used for working tree files. The `const()` variants do not
+ * modify `path`.
  */
 enum scld_error {
 	SCLD_OK = 0,
@@ -254,6 +252,7 @@ enum scld_error safe_create_leading_directories(struct repository *repo, char *p
 enum scld_error safe_create_leading_directories_const(struct repository *repo,
 						      const char *path);
 enum scld_error safe_create_leading_directories_no_share(char *path);
+enum scld_error safe_create_leading_directories_no_share_const(const char *path);
 
 /*
  * Create a file, potentially creating its leading directories in case they

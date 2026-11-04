@@ -1,8 +1,10 @@
 #ifndef ODB_SOURCE_H
 #define ODB_SOURCE_H
 
+#include "hashmap.h"
 #include "object.h"
 #include "odb.h"
+#include "odb/transaction.h"
 
 enum odb_source_type {
 	/*
@@ -24,43 +26,37 @@ enum odb_source_type {
 	ODB_SOURCE_INMEMORY,
 };
 
+/*
+ * Convert between the enum and its name. Returns the equivalent of "unknown"
+ * for unknown types.
+ */
+const char *odb_source_type_to_name(enum odb_source_type type);
+
 struct object_id;
-struct odb_read_stream;
+struct odb_stream;
+struct strbuf;
 struct strvec;
+
+struct odb_create_on_disk_options {
+	/*
+	 * Alternates that shall be written into the newly created object
+	 * database. Whether or not this option can be handled is specific to
+	 * the backend.
+	 */
+	const struct strvec *alternates;
+};
 
 /*
  * The source is the part of the object database that stores the actual
  * objects. It thus encapsulates the logic to read and write the specific
- * on-disk format. An object database can have multiple sources:
- *
- *   - The primary source, which is typically located in "$GIT_DIR/objects".
- *     This is where new objects are usually written to.
- *
- *   - Alternate sources, which are configured via "objects/info/alternates" or
- *     via the GIT_ALTERNATE_OBJECT_DIRECTORIES environment variable. These
- *     alternate sources are only used to read objects.
+ * on-disk format.
  */
 struct odb_source {
-	struct odb_source *next;
-
 	/* Object database that owns this object source. */
 	struct object_database *odb;
 
 	/* The type used by this source. */
 	enum odb_source_type type;
-
-	/*
-	 * Figure out whether this is the local source of the owning
-	 * repository, which would typically be its ".git/objects" directory.
-	 * This local object directory is usually where objects would be
-	 * written to.
-	 */
-	bool local;
-
-	/*
-	 * This object store is ephemeral, so there is no need to fsync.
-	 */
-	int will_destroy;
 
 	/*
 	 * Path to the source. If this is a relative path, it is relative to
@@ -83,6 +79,19 @@ struct odb_source {
 	void (*close)(struct odb_source *source);
 
 	/*
+	 * This callback is expected to create on-disk data structures that are
+	 * required for this source to operate.
+	 *
+	 * The callback is expected to return 0 on success, a negative error
+	 * code otherwise.
+	 *
+	 * This callback may be NULL in case the source does not need any
+	 * on-disk setup.
+	 */
+	int (*create_on_disk)(struct odb_source *source,
+			      const struct odb_create_on_disk_options *opts);
+
+	/*
 	 * This callback is expected to prepare the source so that it becomes
 	 * ready for use. It optionally clears underlying caches of the object
 	 * database source.
@@ -102,20 +111,17 @@ struct odb_source {
 	 *   - `OBJECT_INFO_QUICK` indicates it is fine to use caches without
 	 *     re-verifying the data.
 	 *
-	 *   - `OBJECT_INFO_SECOND_READ` indicates that the initial object
-	 *     lookup has failed and that the object sources should check
-	 *     whether any of its on-disk state has changed that may have
-	 *     caused the object to appear. Sources are free to ignore the
-	 *     second read in case they know that the first read would have
-	 *     already surfaced the object without reloading any on-disk state.
-	 *
-	 * The callback is expected to return a negative error code in case
-	 * reading the object has failed, 0 otherwise.
+	 * The callback is expected to return an `enum odb_read_status`. Please
+	 * refer to the individual values that can be returned. In case reading
+	 * the object has failed with a generic error and `errmsg` is non-NULL,
+	 * the callback is expected to populate it with a human-readable
+	 * message that describes the failure.
 	 */
-	int (*read_object_info)(struct odb_source *source,
-				const struct object_id *oid,
-				struct object_info *oi,
-				enum object_info_flags flags);
+	enum odb_read_status (*read_object_info)(struct odb_source *source,
+						 const struct object_id *oid,
+						 struct object_info *oi,
+						 enum object_info_flags flags,
+						 struct strbuf *errmsg);
 
 	/*
 	 * This callback is expected to create a new read stream that can be
@@ -124,7 +130,7 @@ struct odb_source {
 	 * The callback is expected to return a negative error code in case
 	 * creating the object stream has failed, 0 otherwise.
 	 */
-	int (*read_object_stream)(struct odb_read_stream **out,
+	int (*read_object_stream)(struct odb_stream **out,
 				  struct odb_source *source,
 				  const struct object_id *oid);
 
@@ -189,7 +195,8 @@ struct odb_source {
 	 * has been freshened.
 	 */
 	int (*freshen_object)(struct odb_source *source,
-			      const struct object_id *oid);
+			      const struct object_id *oid,
+			      const time_t *mtime);
 
 	/*
 	 * This callback is expected to persist the given object into the
@@ -205,8 +212,9 @@ struct odb_source {
 	int (*write_object)(struct odb_source *source,
 			    const void *buf, size_t len,
 			    enum object_type type,
-			    struct object_id *oid,
-			    struct object_id *compat_oid,
+			    const struct object_id *oid,
+			    const struct object_id *compat_oid,
+			    const time_t *mtime,
 			    enum odb_write_object_flags flags);
 
 	/*
@@ -218,7 +226,7 @@ struct odb_source {
 	 * otherwise.
 	 */
 	int (*write_object_stream)(struct odb_source *source,
-				   struct odb_write_stream *stream, size_t len,
+				   struct odb_stream *stream,
 				   struct object_id *oid);
 
 	/*
@@ -232,48 +240,62 @@ struct odb_source {
 	 * negative error code otherwise.
 	 */
 	int (*begin_transaction)(struct odb_source *source,
-				 struct odb_transaction **out);
+				 struct odb_transaction **out,
+				 enum odb_transaction_flags flags);
 
 	/*
-	 * This callback is expected to read the list of alternate object
-	 * database sources connected to it and write them into the `strvec`.
+	 * This callback is expected to optimize the object database source.
+	 * Returns 0 on success, a negative error code otherwise.
+	 */
+	int (*optimize)(struct odb_source *source,
+			const struct odb_optimize_options *opts);
+
+	/*
+	 * This callback is expected to check whether optimization of the
+	 * object database source is required given the provided options.
+	 * Returns true if optimization should be performed, false otherwise.
+	 */
+	bool (*optimize_required)(struct odb_source *source,
+				  const struct odb_optimize_options *opts);
+
+	/*
+	 * This callback is expected to start generating a packfile with the
+	 * given options. The pack shall be generated asynchronously so that
+	 * the caller can consume the pack data and progress output while the
+	 * pack is being generated.
 	 *
-	 * The result is expected to be paths to the alternates. All paths must
-	 * be resolved to absolute paths.
+	 * This callback is optional. Sources that cannot generate packfiles
+	 * shall leave it unset.
+	 *
+	 * The callback is expected to return 0 on success and populate the
+	 * `out` pointer with the pack generator, a negative error code
+	 * otherwise.
+	 */
+	int (*generate_pack)(struct odb_source *source,
+			     struct odb_pack_generator **out,
+			     const struct odb_generate_pack_options *opts);
+
+	/*
+	 * This callback is expected to check the integrity of the object source
+	 * and report any errors found via the fsck options. The checks performed
+	 * are backend-specific.
 	 *
 	 * The callback is expected to return 0 on success, a negative error
 	 * code otherwise.
 	 */
-	int (*read_alternates)(struct odb_source *source,
-			       struct strvec *out);
-
-	/*
-	 * This callback is expected to persist the singular alternate passed
-	 * to it into its list of alternates. Any pre-existing alternates are
-	 * expected to remain active. Subsequent calls to `read_alternates` are
-	 * thus expected to yield the pre-existing list of alternates plus the
-	 * newly added alternate appended to its end.
-	 *
-	 * The callback is expected to return 0 on success, a negative error
-	 * code otherwise.
-	 */
-	int (*write_alternate)(struct odb_source *source,
-			       const char *alternate);
+	int (*fsck)(struct odb_source *source,
+		    struct odb_fsck_options *options);
 };
 
 /*
- * Allocate and initialize a new source for the given object database located
- * at `path`. `local` indicates whether or not the source is the local and thus
- * primary object source of the object database.
+ * Allocate and initialize a new source for the given object database. The path
+ * of the source is derived from repository paths.
  */
 struct odb_source *odb_source_new(struct object_database *odb,
-				  const char *path,
-				  bool local);
+				  enum odb_new_flags flags);
 
 /*
  * Initialize the source for the given object database located at `path`.
- * `local` indicates whether or not the source is the local and thus primary
- * object source of the object database.
  *
  * This function is only supposed to be called by specific object source
  * implementations.
@@ -281,8 +303,7 @@ struct odb_source *odb_source_new(struct object_database *odb,
 void odb_source_init(struct odb_source *source,
 		     struct object_database *odb,
 		     enum odb_source_type type,
-		     const char *path,
-		     bool local);
+		     const char *path);
 
 /*
  * Free the object database source, releasing all associated resources and
@@ -309,6 +330,18 @@ static inline void odb_source_close(struct odb_source *source)
 }
 
 /*
+ * Create on-disk data structures that are required for this source to operate
+ * correctly. Returns 0 on success, a negative error code otherwise.
+ */
+static inline int odb_source_create_on_disk(struct odb_source *source,
+					    const struct odb_create_on_disk_options *opts)
+{
+	if (!source->create_on_disk)
+		return 0;
+	return source->create_on_disk(source, opts);
+}
+
+/*
  * Prepare the object database source and clear any caches. Depending on the
  * backend used this may have the effect that concurrently-written objects
  * become visible.
@@ -321,21 +354,26 @@ static inline void odb_source_prepare(struct odb_source *source,
 
 /*
  * Read an object from the object database source identified by its object ID.
- * Returns 0 on success, a negative error code otherwise.
+ * Please refer to `enum odb_read_status` for the individual error codes.
+ *
+ * In case reading the object has failed with a generic error and `errmsg` is
+ * non-NULL it will be populated with a human-readable message that describes
+ * the failure.
  */
-static inline int odb_source_read_object_info(struct odb_source *source,
-					      const struct object_id *oid,
-					      struct object_info *oi,
-					      enum object_info_flags flags)
+static inline enum odb_read_status odb_source_read_object_info(struct odb_source *source,
+							       const struct object_id *oid,
+							       struct object_info *oi,
+							       enum object_info_flags flags,
+							       struct strbuf *errmsg)
 {
-	return source->read_object_info(source, oid, oi, flags);
+	return source->read_object_info(source, oid, oi, flags, errmsg);
 }
 
 /*
  * Create a new read stream for the given object ID. Returns 0 on success, a
  * negative error code otherwise.
  */
-static inline int odb_source_read_object_stream(struct odb_read_stream **out,
+static inline int odb_source_read_object_stream(struct odb_stream **out,
 						struct odb_source *source,
 						const struct object_id *oid)
 {
@@ -401,9 +439,10 @@ static inline int odb_source_find_abbrev_len(struct odb_source *source,
  * not exist.
  */
 static inline int odb_source_freshen_object(struct odb_source *source,
-					    const struct object_id *oid)
+					    const struct object_id *oid,
+					    const time_t *mtime)
 {
-	return source->freshen_object(source, oid);
+	return source->freshen_object(source, oid, mtime);
 }
 
 /*
@@ -414,12 +453,13 @@ static inline int odb_source_freshen_object(struct odb_source *source,
 static inline int odb_source_write_object(struct odb_source *source,
 					  const void *buf, unsigned long len,
 					  enum object_type type,
-					  struct object_id *oid,
-					  struct object_id *compat_oid,
+					  const struct object_id *oid,
+					  const struct object_id *compat_oid,
+					  const time_t *mtime,
 					  enum odb_write_object_flags flags)
 {
 	return source->write_object(source, buf, len, type, oid,
-				    compat_oid, flags);
+				    compat_oid, mtime, flags);
 }
 
 /*
@@ -430,38 +470,10 @@ static inline int odb_source_write_object(struct odb_source *source,
  * out pointer for the object ID.
  */
 static inline int odb_source_write_object_stream(struct odb_source *source,
-						 struct odb_write_stream *stream,
-						 size_t len,
+						 struct odb_stream *stream,
 						 struct object_id *oid)
 {
-	return source->write_object_stream(source, stream, len, oid);
-}
-
-/*
- * Read the list of alternative object database sources from the given backend
- * and populate the `strvec` with them. The listing is not recursive -- that
- * is, if any of the yielded alternate sources has alternates itself, those
- * will not be yielded as part of this function call.
- *
- * Return 0 on success, a negative error code otherwise.
- */
-static inline int odb_source_read_alternates(struct odb_source *source,
-					     struct strvec *out)
-{
-	return source->read_alternates(source, out);
-}
-
-/*
- * Write and persist a new alternate object database source for the given
- * source. Any preexisting alternates are expected to stay valid, and the new
- * alternate shall be appended to the end of the list.
- *
- * Returns 0 on success, a negative error code otherwise.
- */
-static inline int odb_source_write_alternate(struct odb_source *source,
-					      const char *alternate)
-{
-	return source->write_alternate(source, alternate);
+	return source->write_object_stream(source, stream, oid);
 }
 
 /*
@@ -472,9 +484,57 @@ static inline int odb_source_write_alternate(struct odb_source *source,
  * Returns 0 on success, a negative error code otherwise.
  */
 static inline int odb_source_begin_transaction(struct odb_source *source,
-					       struct odb_transaction **out)
+					       struct odb_transaction **out,
+					       enum odb_transaction_flags flags)
 {
-	return source->begin_transaction(source, out);
+	return source->begin_transaction(source, out, flags);
+}
+
+/*
+ * Optimize the object database source. Returns 0 on success, a negative error
+ * code otherwise.
+ */
+static inline int odb_source_optimize(struct odb_source *source,
+				      const struct odb_optimize_options *opts)
+{
+	return source->optimize(source, opts);
+}
+
+/*
+ * Check whether optimization of the object database source is required given
+ * the provided options. Returns true if optimization should be performed,
+ * false otherwise.
+ */
+static inline bool odb_source_optimize_required(struct odb_source *source,
+						const struct odb_optimize_options *opts)
+{
+	return source->optimize_required(source, opts);
+}
+
+/*
+ * Start generating a packfile from the given source with the given options.
+ * The pack is generated asynchronously; the caller is expected to consume the
+ * file descriptors exposed via the pack generator and to then wait for
+ * completion via `odb_pack_generator_finish()`.
+ *
+ * Returns 0 on success and populates the `out` pointer with the pack
+ * generator, a negative error code otherwise.
+ */
+static inline int odb_source_generate_pack(struct odb_source *source,
+					   struct odb_pack_generator **out,
+					   const struct odb_generate_pack_options *opts)
+{
+	return source->generate_pack(source, out, opts);
+}
+
+/*
+ * Check the integrity of the object database source. The checks performed
+ * are backend-specific. Returns 0 on success, a negative error code otherwise.
+ */
+static inline int odb_source_fsck(struct odb_source *source,
+				  struct odb_fsck_options *opts)
+{
+	return source->fsck(source, opts);
 }
 
 #endif

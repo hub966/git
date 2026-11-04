@@ -46,19 +46,19 @@ test_expect_success "clone and setup child repos" '
 	) &&
 	git clone . bundle &&
 	git clone . seven &&
-	git clone --ref-format=reftable . case_sensitive &&
+	git clone --ref-storage-format=reftable . case_sensitive &&
 	(
 		cd case_sensitive &&
 		git branch branch1 &&
 		git branch bRanch1
 	) &&
-	git clone --ref-format=reftable . case_sensitive_fd &&
+	git clone --ref-storage-format=reftable . case_sensitive_fd &&
 	(
 		cd case_sensitive_fd &&
 		git branch foo/bar &&
 		git branch Foo
 	) &&
-	git clone --ref-format=reftable . case_sensitive_df &&
+	git clone --ref-storage-format=reftable . case_sensitive_df &&
 	(
 		cd case_sensitive_df &&
 		git branch Foo/bar &&
@@ -856,7 +856,7 @@ test_expect_success 'fetch from GIT URL with a non-applying branch.<name>.merge 
 # the strange name is: a\!'b
 test_expect_success 'quoting of a strangely named repo' '
 	test_must_fail git fetch "a\\!'\''b" > result 2>&1 &&
-	grep "fatal: '\''a\\\\!'\''b'\''" result
+	test_grep "fatal: '\''a\\\\!'\''b'\''" result
 '
 
 test_expect_success 'bundle should record HEAD correctly' '
@@ -1010,14 +1010,14 @@ test_expect_success 'fetch --dry-run does not touch FETCH_HEAD, but still prints
 	rm -f .git/FETCH_HEAD err &&
 	git fetch --dry-run . 2>err &&
 	! test -f .git/FETCH_HEAD &&
-	grep FETCH_HEAD err
+	test_grep FETCH_HEAD err
 '
 
 test_expect_success '--no-write-fetch-head does not touch FETCH_HEAD, and does not print what would be written' '
 	rm -f .git/FETCH_HEAD err &&
 	git fetch --no-write-fetch-head . 2>err &&
 	! test -f .git/FETCH_HEAD &&
-	! grep FETCH_HEAD err
+	test_grep ! FETCH_HEAD err
 '
 
 test_expect_success '--write-fetch-head gets defeated by --dry-run' '
@@ -1084,6 +1084,65 @@ test_expect_success 'fetch.writeCommitGraph' '
 		cd write &&
 		git -c fetch.writeCommitGraph fetch origin &&
 		test_path_is_file .git/objects/info/commit-graphs/commit-graph-chain
+	)
+'
+
+test_expect_success 'fetch.writeCommitGraph adds fetched commits incrementally' '
+	git init incremental-source &&
+	test_commit -C incremental-source one &&
+	git clone incremental-source incremental-dest &&
+	test_commit -C incremental-dest local &&
+	git -C incremental-dest commit-graph write --reachable --split &&
+	test_commit -C incremental-source two &&
+	test_commit -C incremental-source three &&
+	(
+		cd incremental-dest &&
+		git -c fetch.writeCommitGraph=true fetch origin &&
+		test-tool read-graph commit-info three two local
+	)
+'
+
+test_expect_success 'fetch.writeCommitGraph does not add unrelated commits' '
+	git init unrelated-source &&
+	test_commit -C unrelated-source initial &&
+	git clone unrelated-source unrelated-dest &&
+	git -C unrelated-dest commit-graph write --reachable --split &&
+	test_commit -C unrelated-source fetched &&
+	(
+		cd unrelated-dest &&
+		test_env GIT_TEST_COMMIT_GRAPH=0 test_commit local-only &&
+		git -c fetch.writeCommitGraph=true fetch origin &&
+		test-tool read-graph commit-info fetched &&
+		test_expect_code 1 \
+			test-tool read-graph commit-info local-only 2>/dev/null
+	)
+'
+
+test_expect_success 'fetch.writeCommitGraph skips write on no-op fetch' '
+	git init noop-source &&
+	test_commit -C noop-source one &&
+	git clone noop-source noop-dest &&
+	git -C noop-dest commit-graph write --reachable --split &&
+	(
+		cd noop-dest &&
+		GIT_TRACE2_EVENT="$(pwd)/trace2.txt" \
+			git -c fetch.writeCommitGraph=true fetch origin &&
+		test_region ! fetch write-commit-graph trace2.txt
+	)
+'
+
+test_expect_success 'fetch.writeCommitGraph falls back to reachable scan without existing graph' '
+	git init first-graph-source &&
+	test_commit -C first-graph-source base &&
+	git clone first-graph-source first-graph-dest &&
+	test_commit -C first-graph-source fetched &&
+	(
+		cd first-graph-dest &&
+		test_commit local &&
+		rm -rf .git/objects/info/commit-graphs &&
+		rm -f .git/objects/info/commit-graph &&
+		git -c fetch.writeCommitGraph=true fetch origin &&
+		test-tool read-graph commit-info fetched local base
 	)
 '
 
@@ -1435,7 +1494,7 @@ test_expect_success 'fetching with auto-gc does not lock up' '
 		git config maintenance.strategy gc &&
 		GIT_ASK_YESNO="$TRASH_DIRECTORY/askyesno" git fetch --verbose >fetch.out 2>&1 &&
 		test_grep "Auto packing the repository" fetch.out &&
-		! grep "Should I try again" fetch.out
+		test_grep ! "Should I try again" fetch.out
 	)
 '
 
@@ -1444,7 +1503,7 @@ do
 	test_expect_success "$section.hideRefs affects connectivity check" '
 		GIT_TRACE="$PWD"/trace git -c $section.hideRefs=refs -c \
 			$section.hideRefs="!refs/tags/" fetch &&
-		grep "git rev-list .*--exclude-hidden=fetch" trace
+		test_grep "git rev-list .*--exclude-hidden=fetch" trace
 	'
 done
 
@@ -1803,7 +1862,7 @@ test_expect_success CASE_INSENSITIVE_FS,REFFILES 'existing references in a case 
 test_expect_success REFFILES 'existing reference lock in repo' '
 	test_when_finished rm -rf base repo &&
 	(
-		git init --ref-format=reftable base &&
+		git init --ref-storage-format=reftable base &&
 		cd base &&
 		echo >file update &&
 		git add . &&
@@ -1814,7 +1873,7 @@ test_expect_success REFFILES 'existing reference lock in repo' '
 		git update-ref refs/heads/branch @ &&
 		cd .. &&
 
-		git init --ref-format=files --bare repo &&
+		git init --ref-storage-format=files --bare repo &&
 		cd repo &&
 		git remote add origin ../base &&
 		touch refs/heads/foo.lock &&
@@ -1857,7 +1916,7 @@ test_expect_success CASE_INSENSITIVE_FS,REFFILES 'D/F conflict on case insensiti
 test_expect_success REFFILES 'D/F conflict on case sensitive filesystem with lock' '
 	test_when_finished rm -rf base repo &&
 	(
-		git init --ref-format=reftable base &&
+		git init --ref-storage-format=reftable base &&
 		cd base &&
 		echo >file update &&
 		git add . &&
@@ -1868,7 +1927,7 @@ test_expect_success REFFILES 'D/F conflict on case sensitive filesystem with loc
 		git update-ref refs/heads/branch @ &&
 		cd .. &&
 
-		git init --ref-format=files --bare repo &&
+		git init --ref-storage-format=files --bare repo &&
 		cd repo &&
 		git remote add origin ../base &&
 		mkdir refs/heads/foo &&

@@ -470,7 +470,7 @@ int prepare_midx_pack(struct multi_pack_index *m,
 	strbuf_addf(&pack_name, "%s/pack/%s", packed->base.path,
 		    m->pack_names[pack_int_id]);
 	p = packfile_store_load_pack(packed,
-				     pack_name.buf, packed->base.local);
+				     pack_name.buf, packed->local);
 	strbuf_release(&pack_name);
 
 	if (!p) {
@@ -583,29 +583,36 @@ off_t nth_midxed_offset(struct multi_pack_index *m, uint32_t pos)
 
 uint32_t nth_midxed_pack_int_id(struct multi_pack_index *m, uint32_t pos)
 {
-	pos = midx_for_object(&m, pos);
+	uint32_t pack_int_id;
 
-	return m->num_packs_in_base + get_be32(m->chunk_object_offsets +
-					       (off_t)pos * MIDX_CHUNK_OFFSET_WIDTH);
+	pos = midx_for_object(&m, pos);
+	pack_int_id = get_be32(m->chunk_object_offsets +
+			       (off_t)pos * MIDX_CHUNK_OFFSET_WIDTH);
+	if (pack_int_id >= m->num_packs)
+		die(_("bad pack-int-id: %"PRIu32" (%"PRIu32" total packs)"),
+		    pack_int_id, m->num_packs);
+
+	return m->num_packs_in_base + pack_int_id;
 }
 
-int fill_midx_entry(struct multi_pack_index *m,
-		    const struct object_id *oid,
-		    struct pack_entry *e)
+enum midx_fill_result midx_fill_entry(struct multi_pack_index *m,
+				      const struct object_id *oid,
+				      struct pack_entry *e,
+				      struct packed_git **bad_pack)
 {
 	uint32_t pos;
 	uint32_t pack_int_id;
 	struct packed_git *p;
 
 	if (!bsearch_midx(oid, m, &pos))
-		return 0;
+		return MIDX_FILL_MISS;
 
 	midx_for_object(&m, pos);
 	pack_int_id = nth_midxed_pack_int_id(m, pos);
 
 	if (prepare_midx_pack(m, pack_int_id))
-		return 0;
-	p = m->packs[pack_int_id - m->num_packs_in_base];
+		return MIDX_FILL_OWNER_UNAVAILABLE;
+	p = nth_midxed_pack(m, pack_int_id);
 
 	/*
 	* We are about to tell the caller where they can locate the
@@ -615,16 +622,19 @@ int fill_midx_entry(struct multi_pack_index *m,
 	* loaded!
 	*/
 	if (!is_pack_valid(p))
-		return 0;
+		return MIDX_FILL_OWNER_UNAVAILABLE;
 
 	if (oidset_size(&p->bad_objects) &&
-	    oidset_contains(&p->bad_objects, oid))
-		return 0;
+	    oidset_contains(&p->bad_objects, oid)) {
+		if (bad_pack && !*bad_pack)
+			*bad_pack = p;
+		return MIDX_FILL_MISS;
+	}
 
 	e->offset = nth_midxed_offset(m, pos);
 	e->p = p;
 
-	return 1;
+	return MIDX_FILL_HIT;
 }
 
 /* Match "foo.idx" against either "foo.pack" _or_ "foo.idx". */
@@ -825,28 +835,22 @@ void clear_incremental_midx_files_ext(struct odb_source_packed *source, const ch
 
 void clear_midx_file(struct repository *r)
 {
-	struct odb_source_files *files;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 	struct strbuf midx = STRBUF_INIT;
 
-	if (r->objects) {
-		struct odb_source *source;
-
-		for (source = r->objects->sources; source; source = source->next) {
-			files = odb_source_files_downcast(source);
-			if (files->packed->midx)
-				close_midx(files->packed->midx);
-			files->packed->midx = NULL;
-		}
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		if (dir->packed->midx)
+			close_midx(dir->packed->midx);
+		dir->packed->midx = NULL;
 	}
 
-	files = odb_source_files_downcast(r->objects->sources);
-	get_midx_filename(files->packed, &midx);
+	get_midx_filename(files->dirs->packed, &midx);
 
 	if (remove_path(midx.buf))
 		die(_("failed to clear multi-pack-index at %s"), midx.buf);
 
-	clear_midx_files_ext(files->packed, MIDX_EXT_BITMAP, NULL);
-	clear_midx_files_ext(files->packed, MIDX_EXT_REV, NULL);
+	clear_midx_files_ext(files->dirs->packed, MIDX_EXT_BITMAP, NULL);
+	clear_midx_files_ext(files->dirs->packed, MIDX_EXT_REV, NULL);
 
 	strbuf_release(&midx);
 }
@@ -854,27 +858,24 @@ void clear_midx_file(struct repository *r)
 void clear_incremental_midx_files(struct repository *r,
 				  const struct strvec *keep_hashes)
 {
-	struct odb_source_files *files;
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 	struct strbuf chain = STRBUF_INIT;
 
-	for (source = r->objects->sources; source; source = source->next) {
-		files = odb_source_files_downcast(source);
-		if (files->packed->midx)
-			close_midx(files->packed->midx);
-		files->packed->midx = NULL;
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		if (dir->packed->midx)
+			close_midx(dir->packed->midx);
+		dir->packed->midx = NULL;
 	}
 
-	files = odb_source_files_downcast(r->objects->sources);
-	get_midx_chain_filename(files->packed, &chain);
+	get_midx_chain_filename(files->dirs->packed, &chain);
 
 	if (!keep_hashes && remove_path(chain.buf))
 		die(_("failed to clear multi-pack-index chain at %s"),
 		    chain.buf);
 
-	clear_incremental_midx_files_ext(files->packed, MIDX_EXT_BITMAP, keep_hashes);
-	clear_incremental_midx_files_ext(files->packed, MIDX_EXT_REV, keep_hashes);
-	clear_incremental_midx_files_ext(files->packed, MIDX_EXT_MIDX, keep_hashes);
+	clear_incremental_midx_files_ext(files->dirs->packed, MIDX_EXT_BITMAP, keep_hashes);
+	clear_incremental_midx_files_ext(files->dirs->packed, MIDX_EXT_REV, keep_hashes);
+	clear_incremental_midx_files_ext(files->dirs->packed, MIDX_EXT_MIDX, keep_hashes);
 
 	strbuf_release(&chain);
 }
@@ -1028,7 +1029,7 @@ int verify_midx_file(struct odb_source_packed *source, unsigned flags)
 
 		nth_midxed_object_oid(&oid, m, pairs[i].pos);
 
-		if (!fill_midx_entry(m, &oid, &e)) {
+		if (midx_fill_entry(m, &oid, &e, NULL) != MIDX_FILL_HIT) {
 			midx_report(_("failed to load pack entry for oid[%d] = %s"),
 				    pairs[i].pos, oid_to_hex(&oid));
 			continue;

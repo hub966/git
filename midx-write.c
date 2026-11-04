@@ -865,7 +865,7 @@ static void find_commits_for_midx_bitmap(struct commit_stack *commits,
 	 * complain later that we don't have reachability closure (and fail
 	 * appropriately).
 	 */
-	fetch_if_missing = 0;
+	ctx->repo->fetch_if_missing = 0;
 	revs.exclude_promisor_objects = 1;
 
 	if (prepare_revision_walk(&revs))
@@ -1627,8 +1627,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 			struct strbuf lock_name = STRBUF_INIT;
 
 			get_midx_chain_filename(opts->source, &lock_name);
-			hold_lock_file_for_update(&lk, lock_name.buf,
-						  LOCK_DIE_ON_ERROR);
+			repo_hold_lock_file_for_update(r, &lk, lock_name.buf,
+						       LOCK_DIE_ON_ERROR);
 			strbuf_release(&lock_name);
 		}
 
@@ -1647,7 +1647,8 @@ static int write_midx_internal(struct write_midx_opts *opts)
 		f = hashfd(r->hash_algo, get_tempfile_fd(incr),
 			   get_tempfile_path(incr));
 	} else {
-		hold_lock_file_for_update(&lk, midx_name.buf, LOCK_DIE_ON_ERROR);
+		repo_hold_lock_file_for_update(r, &lk, midx_name.buf,
+					       LOCK_DIE_ON_ERROR);
 		f = hashfd(r->hash_algo, get_lock_file_fd(&lk),
 			   get_lock_file_path(&lk));
 	}

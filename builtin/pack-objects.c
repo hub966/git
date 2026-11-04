@@ -32,6 +32,7 @@
 #include "list.h"
 #include "packfile.h"
 #include "object-file.h"
+#include "object-file-convert.h"
 #include "odb.h"
 #include "odb/streaming.h"
 #include "replace-object.h"
@@ -260,8 +261,8 @@ static int exclude_promisor_objects_best_effort;
 
 static int use_delta_islands;
 
-static unsigned long delta_cache_size = 0;
-static unsigned long max_delta_cache_size = DEFAULT_DELTA_CACHE_SIZE;
+static size_t delta_cache_size = 0;
+static size_t max_delta_cache_size = DEFAULT_DELTA_CACHE_SIZE;
 static unsigned long cache_max_small_delta_size = 1000;
 
 static unsigned long window_memory_limit = 0;
@@ -353,7 +354,8 @@ static void index_commit_for_bitmap(struct commit *commit)
 
 static void *get_delta(struct object_entry *entry)
 {
-	unsigned long size, base_size, delta_size;
+	unsigned long size, base_size;
+	size_t delta_size;
 	void *buf, *base_buf, *delta_buf;
 	enum object_type type;
 	size_t size_st = 0, base_size_st = 0;
@@ -410,7 +412,7 @@ static unsigned long do_compress(void **pptr, unsigned long size)
 	return stream.total_out;
 }
 
-static unsigned long write_large_blob_data(struct odb_read_stream *st, struct hashfile *f,
+static unsigned long write_large_blob_data(struct odb_stream *st, struct hashfile *f,
 					   const struct object_id *oid)
 {
 	git_zstream stream;
@@ -424,7 +426,7 @@ static unsigned long write_large_blob_data(struct odb_read_stream *st, struct ha
 	for (;;) {
 		ssize_t readlen;
 		int zret = Z_OK;
-		readlen = odb_read_stream_read(st, ibuf, sizeof(ibuf));
+		readlen = odb_stream_read(st, ibuf, sizeof(ibuf));
 		if (readlen == -1)
 			die(_("unable to read %s"), oid_to_hex(oid));
 
@@ -487,7 +489,7 @@ static void copy_pack_data(struct hashfile *f,
 		off_t len)
 {
 	unsigned char *in;
-	unsigned long avail;
+	size_t avail;
 
 	while (len) {
 		in = use_pack(p, w_curs, offset, &avail);
@@ -520,15 +522,15 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 	unsigned hdrlen;
 	enum object_type type;
 	void *buf;
-	struct odb_read_stream *st = NULL;
+	struct odb_stream *st = NULL;
 	const unsigned hashsz = the_hash_algo->rawsz;
 
 	if (!usable_delta) {
 		if (oe_type(entry) == OBJ_BLOB &&
 		    oe_size_greater_than(&to_pack, entry,
 					 repo_settings_get_big_file_threshold(the_repository)) &&
-		    (st = odb_read_stream_open(the_repository->objects, &entry->idx.oid,
-					       NULL)) != NULL) {
+		    (st = odb_stream_from_object(the_repository->objects, &entry->idx.oid,
+						 NULL)) != NULL) {
 			buf = NULL;
 			type = st->type;
 			size = st->size;
@@ -588,7 +590,7 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 			dheader[--pos] = 128 | (--ofs & 127);
 		if (limit && hdrlen + sizeof(dheader) - pos + datalen + hashsz >= limit) {
 			if (st)
-				odb_read_stream_close(st);
+				odb_stream_close(st);
 			free(buf);
 			return 0;
 		}
@@ -602,7 +604,7 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 		 */
 		if (limit && hdrlen + hashsz + datalen + hashsz >= limit) {
 			if (st)
-				odb_read_stream_close(st);
+				odb_stream_close(st);
 			free(buf);
 			return 0;
 		}
@@ -612,7 +614,7 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 	} else {
 		if (limit && hdrlen + datalen + hashsz >= limit) {
 			if (st)
-				odb_read_stream_close(st);
+				odb_stream_close(st);
 			free(buf);
 			return 0;
 		}
@@ -620,7 +622,7 @@ static unsigned long write_no_reuse_object(struct hashfile *f, struct object_ent
 	}
 	if (st) {
 		datalen = write_large_blob_data(st, f, &entry->idx.oid);
-		odb_read_stream_close(st);
+		odb_stream_close(st);
 	} else {
 		hashwrite(f, buf, datalen);
 		free(buf);
@@ -1336,6 +1338,7 @@ static void write_pack_file(void)
 	uint32_t nr_remaining = nr_result;
 	time_t last_mtime = 0;
 	struct object_entry **write_order;
+	off_t bytes_written = 0;
 
 	if (progress > pack_to_stdout)
 		progress_state = start_progress(the_repository,
@@ -1388,6 +1391,8 @@ static void write_pack_file(void)
 			display_progress(progress_state, written);
 		}
 
+		bytes_written += hashfile_total(f) +
+			the_repository->hash_algo->rawsz;
 		if (pack_to_stdout) {
 			/*
 			 * We never fsync when writing to stdout since we may
@@ -1509,6 +1514,8 @@ static void write_pack_file(void)
 		    written, nr_result);
 	trace2_data_intmax("pack-objects", the_repository,
 			   "write_pack_file/wrote", nr_result);
+	trace2_data_intmax("pack-objects", the_repository,
+			   "write_pack_file/wrote_bytes", bytes_written);
 }
 
 static int no_try_delta(const char *path)
@@ -1559,11 +1566,10 @@ static int want_cruft_object_mtime(struct repository *r,
 				   const struct object_id *oid,
 				   unsigned flags, uint32_t mtime)
 {
-	struct odb_source *source;
+	struct odb_source_files *files = odb_source_files_downcast(r->objects->source);
 
-	for (source = r->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct packed_git **cache = packfile_store_get_kept_pack_cache(files->packed, flags);
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		struct packed_git **cache = packfile_store_get_kept_pack_cache(dir->packed, flags);
 
 		for (; *cache; cache++) {
 			struct packed_git *p = *cache;
@@ -1746,21 +1752,19 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 				     off_t *found_offset,
 				     uint32_t found_mtime)
 {
+	struct odb_source_files *files =
+		odb_source_files_downcast(the_repository->objects->source);
 	int want;
 	struct packfile_list_entry *e;
-	struct odb_source *source;
 
 	if (!exclude && local) {
 		/*
-		 * Note that we start iterating at `sources->next` so that we
-		 * skip the local object source.
+		 * Note that we start iterating at `dirs->next` so that we
+		 * skip the local object directory.
 		 */
-		struct odb_source *source = the_repository->objects->sources->next;
-		for (; source; source = source->next) {
-			struct odb_source_files *files = odb_source_files_downcast(source);
-			if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0))
+		for (struct odb_files_dir *dir = files->dirs->next; dir; dir = dir->next)
+			if (!odb_source_read_object_info(&dir->loose->base, oid, NULL, 0, NULL))
 				return 0;
-		}
 	}
 
 	/*
@@ -1778,28 +1782,23 @@ static int want_object_in_pack_mtime(const struct object_id *oid,
 		*found_offset = 0;
 	}
 
-	odb_prepare_alternates(the_repository->objects);
-
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-		struct multi_pack_index *m = get_multi_pack_index(files->packed);
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		struct multi_pack_index *m = get_multi_pack_index(dir->packed);
 		struct pack_entry e;
 
-		if (m && fill_midx_entry(m, oid, &e)) {
+		if (m && midx_fill_entry(m, oid, &e, NULL) == MIDX_FILL_HIT) {
 			want = want_object_in_pack_one(e.p, oid, exclude, found_pack, found_offset, found_mtime);
 			if (want != -1)
 				return want;
 		}
 	}
 
-	for (source = the_repository->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		for (e = files->packed->packs.head; e; e = e->next) {
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		for (e = dir->packed->packs.head; e; e = e->next) {
 			struct packed_git *p = e->pack;
 			want = want_object_in_pack_one(p, oid, exclude, found_pack, found_offset, found_mtime);
 			if (!exclude && want > 0)
-				packfile_list_prepend(&files->packed->packs, p);
+				packfile_list_prepend(&dir->packed->packs, p);
 			if (want != -1)
 				return want;
 		}
@@ -1867,8 +1866,8 @@ static const char no_closure_warning[] = N_(
 "disabling bitmap writing, as some objects are not being packed"
 );
 
-static int add_object_entry(const struct object_id *oid, enum object_type type,
-			    const char *name, int exclude)
+static void add_object_entry(const struct object_id *oid, enum object_type type,
+			     const char *name, int exclude)
 {
 	struct packed_git *found_pack = NULL;
 	off_t found_offset = 0;
@@ -1876,7 +1875,7 @@ static int add_object_entry(const struct object_id *oid, enum object_type type,
 	display_progress(progress_state, ++nr_seen);
 
 	if (have_duplicate_entry(oid, exclude))
-		return 0;
+		return;
 
 	if (!want_object_in_pack(oid, exclude, &found_pack, &found_offset)) {
 		/* The pack is missing an object, so it will not have closure */
@@ -1885,13 +1884,12 @@ static int add_object_entry(const struct object_id *oid, enum object_type type,
 				warning(_(no_closure_warning));
 			write_bitmap_index = 0;
 		}
-		return 0;
+		return;
 	}
 
 	create_object_entry(oid, type, pack_name_hash_fn(name),
 			    exclude, name && no_try_delta(name),
 			    found_pack, found_offset);
-	return 1;
 }
 
 static int add_object_entry_from_bitmap(const struct object_id *oid,
@@ -1909,7 +1907,7 @@ static int add_object_entry_from_bitmap(const struct object_id *oid,
 		return 0;
 
 	create_object_entry(oid, type, name_hash, 0, 0, pack, offset);
-	return 1;
+	return 0;
 }
 
 struct pbase_tree_cache {
@@ -2259,8 +2257,7 @@ static void check_object(struct object_entry *entry, uint32_t object_index)
 		int have_base = 0;
 		struct object_id base_ref;
 		struct object_entry *base_entry;
-		unsigned long used, used_0;
-		unsigned long avail;
+		size_t used, used_0, avail;
 		off_t ofs;
 		unsigned char *buf, c;
 		enum object_type type;
@@ -2688,8 +2685,8 @@ struct unpacked {
 	unsigned depth;
 };
 
-static int delta_cacheable(unsigned long src_size, unsigned long trg_size,
-			   unsigned long delta_size)
+static int delta_cacheable(size_t src_size, size_t trg_size,
+			   size_t delta_size)
 {
 	if (max_delta_cache_size && delta_cache_size + delta_size > max_delta_cache_size)
 		return 0;
@@ -2772,8 +2769,7 @@ size_t oe_get_size_slow(struct packing_data *pack,
 	struct pack_window *w_curs;
 	unsigned char *buf;
 	enum object_type type;
-	unsigned long used, avail;
-	size_t size;
+	size_t used, avail, size;
 
 	if (e->type_ != OBJ_OFS_DELTA && e->type_ != OBJ_REF_DELTA) {
 		size_t sz;
@@ -2804,11 +2800,12 @@ size_t oe_get_size_slow(struct packing_data *pack,
 }
 
 static int try_delta(struct unpacked *trg, struct unpacked *src,
-		     unsigned max_depth, unsigned long *mem_usage)
+		     unsigned max_depth, size_t *mem_usage)
 {
 	struct object_entry *trg_entry = trg->entry;
 	struct object_entry *src_entry = src->entry;
-	unsigned long trg_size, src_size, delta_size, sizediff, max_size, sz;
+	unsigned long trg_size, src_size, sizediff, max_size, sz;
+	size_t delta_size;
 	unsigned ref_depth;
 	enum object_type type;
 	void *delta_buf;
@@ -2972,9 +2969,9 @@ static unsigned int check_delta_limit(struct object_entry *me, unsigned int n)
 	return m;
 }
 
-static unsigned long free_unpacked(struct unpacked *n)
+static size_t free_unpacked(struct unpacked *n)
 {
-	unsigned long freed_mem = sizeof_delta_index(n->index);
+	size_t freed_mem = sizeof_delta_index(n->index);
 	free_delta_index(n->index);
 	n->index = NULL;
 	if (n->data) {
@@ -2991,7 +2988,7 @@ static void find_deltas(struct object_entry **list, unsigned *list_size,
 {
 	uint32_t i, idx = 0, count = 0;
 	struct unpacked *array;
-	unsigned long mem_usage = 0;
+	size_t mem_usage = 0;
 
 	CALLOC_ARRAY(array, window);
 
@@ -3701,7 +3698,7 @@ static int git_pack_config(const char *k, const char *v,
 		return 0;
 	}
 	if (!strcmp(k, "pack.deltacachesize")) {
-		max_delta_cache_size = git_config_int(k, v, ctx->kvi);
+		max_delta_cache_size = git_config_size_t(k, v, ctx->kvi);
 		return 0;
 	}
 	if (!strcmp(k, "pack.deltacachelimit")) {
@@ -4087,9 +4084,10 @@ static void stdin_packs_read_input(struct rev_info *revs,
 
 static void add_unreachable_loose_objects(struct rev_info *revs);
 
-static void read_stdin_packs(enum stdin_packs_mode mode, int rev_list_unpacked)
+static void read_stdin_packs(struct repository *repo,
+			     enum stdin_packs_mode mode, int rev_list_unpacked)
 {
-	int prev_fetch_if_missing = fetch_if_missing;
+	int prev_fetch_if_missing = repo->fetch_if_missing;
 	struct rev_info revs;
 
 	/*
@@ -4097,9 +4095,9 @@ static void read_stdin_packs(enum stdin_packs_mode mode, int rev_list_unpacked)
 	 * walk is best-effort though we don't want to perform backfill fetches
 	 * for them.
 	 */
-	fetch_if_missing = 0;
+	repo->fetch_if_missing = 0;
 
-	repo_init_revisions(the_repository, &revs, NULL);
+	repo_init_revisions(repo, &revs, NULL);
 	/*
 	 * Use a revision walk to fill in the namehash of objects in the include
 	 * packs. To save time, we'll avoid traversing through objects that are
@@ -4145,7 +4143,7 @@ static void read_stdin_packs(enum stdin_packs_mode mode, int rev_list_unpacked)
 	trace2_data_intmax("pack-objects", the_repository, "stdin_packs_hints",
 			   stdin_packs_hints_nr);
 
-	fetch_if_missing = prev_fetch_if_missing;
+	repo->fetch_if_missing = prev_fetch_if_missing;
 }
 
 static void add_cruft_object_entry(const struct object_id *oid, enum object_type type,
@@ -4166,14 +4164,13 @@ static void add_cruft_object_entry(const struct object_id *oid, enum object_type
 		if (!want_object_in_pack_mtime(oid, 0, &pack, &offset, mtime))
 			return;
 		if (!pack && type == OBJ_BLOB) {
-			struct odb_source *source = the_repository->objects->sources;
+			struct odb_source_files *files =
+				odb_source_files_downcast(the_repository->objects->source);
 			int found = 0;
 
-			for (; !found && source; source = source->next) {
-				struct odb_source_files *files = odb_source_files_downcast(source);
-				if (!odb_source_read_object_info(&files->loose->base, oid, NULL, 0))
+			for (struct odb_files_dir *dir = files->dirs; !found && dir; dir = dir->next)
+				if (!odb_source_read_object_info(&dir->loose->base, oid, NULL, 0, NULL))
 					found = 1;
-			}
 
 			/*
 			 * If a traversed tree has a missing blob then we want
@@ -4455,9 +4452,11 @@ static void show_object__ma_allow_promisor(struct object *obj, const char *name,
 	show_object(obj, name, data);
 }
 
-static int option_parse_missing_action(const struct option *opt UNUSED,
+static int option_parse_missing_action(const struct option *opt,
 				       const char *arg, int unset)
 {
+	struct repository *repo = opt->value;
+
 	assert(arg);
 	assert(!unset);
 
@@ -4469,14 +4468,14 @@ static int option_parse_missing_action(const struct option *opt UNUSED,
 
 	if (!strcmp(arg, "allow-any")) {
 		arg_missing_action = MA_ALLOW_ANY;
-		fetch_if_missing = 0;
+		repo->fetch_if_missing = 0;
 		fn_show_object = show_object__ma_allow_any;
 		return 0;
 	}
 
 	if (!strcmp(arg, "allow-promisor")) {
 		arg_missing_action = MA_ALLOW_PROMISOR;
-		fetch_if_missing = 0;
+		repo->fetch_if_missing = 0;
 		fn_show_object = show_object__ma_allow_promisor;
 		return 0;
 	}
@@ -4506,7 +4505,8 @@ static int add_object_in_unpacked_pack(const struct object_id *oid,
 
 static void add_objects_in_unpacked_packs(void)
 {
-	struct odb_source *source;
+	struct odb_source_files *files =
+		odb_source_files_downcast(to_pack.repo->objects->source);
 	time_t mtime;
 	struct odb_for_each_object_options opts = {
 		.flags = ODB_FOR_EACH_OBJECT_PACK_ORDER |
@@ -4520,14 +4520,11 @@ static void add_objects_in_unpacked_packs(void)
 		.source_infop = &source_info,
 	};
 
-	odb_prepare_alternates(to_pack.repo->objects);
-	for (source = to_pack.repo->objects->sources; source; source = source->next) {
-		struct odb_source_files *files = odb_source_files_downcast(source);
-
-		if (!source->local)
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next) {
+		if (!dir->local)
 			continue;
 
-		if (odb_source_for_each_object(&files->packed->base, &oi,
+		if (odb_source_for_each_object(&dir->packed->base, &oi,
 					       add_object_in_unpacked_pack, NULL, &opts))
 			die(_("cannot open pack index"));
 	}
@@ -4571,7 +4568,7 @@ static int add_loose_object(const struct object_id *oid, const char *path,
  */
 static void add_unreachable_loose_objects(struct rev_info *revs)
 {
-	for_each_loose_file_in_source(the_repository->objects->sources,
+	for_each_loose_file_in_source(the_repository->objects->source,
 				      add_loose_object, NULL, NULL, revs);
 }
 
@@ -4622,6 +4619,49 @@ static int loosened_object_can_be_discarded(const struct object_id *oid,
 	return 1;
 }
 
+static int force_object_loose(struct odb_source *source,
+			      const struct object_id *oid,
+			      const time_t *mtime)
+{
+	struct odb_source_files *files = odb_source_files_downcast(source);
+	const struct git_hash_algo *compat = source->odb->repo->compat_hash_algo;
+	struct object_info oi = OBJECT_INFO_INIT;
+	struct object_id compat_oid, *compat_oid_p = NULL;
+	enum object_type type;
+	void *buf = NULL;
+	size_t len;
+	int ret;
+
+	for (struct odb_files_dir *dir = files->dirs; dir; dir = dir->next)
+		if (!odb_source_read_object_info(&dir->loose->base, oid, NULL, 0, NULL))
+			return 0;
+
+	oi.typep = &type;
+	oi.sizep = &len;
+	oi.contentp = &buf;
+	if (odb_read_object_info_extended(source->odb, oid, &oi, 0)) {
+		ret = error(_("cannot read object for %s"), oid_to_hex(oid));
+		goto out;
+	}
+
+	if (compat) {
+		if (repo_oid_to_algop(source->odb->repo, oid, compat, &compat_oid)) {
+			ret = error(_("cannot map object %s to %s"),
+				    oid_to_hex(oid), compat->name);
+			goto out;
+		}
+
+		compat_oid_p = &compat_oid;
+	}
+
+	ret = odb_source_write_object(&files->dirs->loose->base, buf, len, type, oid,
+				      compat_oid_p, mtime, 0);
+
+out:
+	free(buf);
+	return ret;
+}
+
 static void loosen_unused_packed_objects(void)
 {
 	struct packed_git *p;
@@ -4641,8 +4681,8 @@ static void loosen_unused_packed_objects(void)
 			if (!packlist_find(&to_pack, &oid) &&
 			    !has_sha1_pack_kept_or_nonlocal(&oid) &&
 			    !loosened_object_can_be_discarded(&oid, p->mtime)) {
-				if (force_object_loose(the_repository->objects->sources,
-						       &oid, p->mtime))
+				if (force_object_loose(the_repository->objects->source,
+						       &oid, &p->mtime))
 					die(_("unable to force loose object"));
 				loosened_objects_nr++;
 			}
@@ -5073,7 +5113,7 @@ static int parse_stdin_packs_mode(const struct option *opt, const char *arg,
 int cmd_pack_objects(int argc,
 		     const char **argv,
 		     const char *prefix,
-		     struct repository *repo UNUSED)
+		     struct repository *repo)
 {
 	int use_internal_rev_list = 0;
 	int all_progress_implied = 0;
@@ -5180,7 +5220,7 @@ int cmd_pack_objects(int argc,
 			      N_("write a bitmap index if possible"),
 			      WRITE_BITMAP_QUIET, PARSE_OPT_HIDDEN),
 		OPT_PARSE_LIST_OBJECTS_FILTER(&filter_options),
-		OPT_CALLBACK_F(0, "missing", NULL, N_("action"),
+		OPT_CALLBACK_F(0, "missing", repo, N_("action"),
 		  N_("handling for missing objects"), PARSE_OPT_NONEG,
 		  option_parse_missing_action),
 		OPT_BOOL(0, "exclude-promisor-objects", &exclude_promisor_objects,
@@ -5300,7 +5340,7 @@ int cmd_pack_objects(int argc,
 				  exclude_promisor_objects_best_effort,
 				  "--exclude-promisor-objects-best-effort");
 	if (exclude_promisor_objects) {
-		fetch_if_missing = 0;
+		repo->fetch_if_missing = 0;
 
 		/* --stdin-packs handles promisor objects separately. */
 		if (!stdin_packs) {
@@ -5309,8 +5349,9 @@ int cmd_pack_objects(int argc,
 		}
 	} else if (exclude_promisor_objects_best_effort) {
 		use_internal_rev_list = 1;
-		fetch_if_missing = 0;
-		option_parse_missing_action(NULL, "allow-any", 0);
+		arg_missing_action = MA_ALLOW_ANY;
+		repo->fetch_if_missing = 0;
+		fn_show_object = show_object__ma_allow_any;
 		/* revs configured below */
 	}
 	if (unpack_unreachable || keep_unreachable || pack_loose_unreachable)
@@ -5426,7 +5467,7 @@ int cmd_pack_objects(int argc,
 		progress_state = start_progress(the_repository,
 						_("Enumerating objects"), 0);
 	if (stdin_packs) {
-		read_stdin_packs(stdin_packs, rev_list_unpacked);
+		read_stdin_packs(repo, stdin_packs, rev_list_unpacked);
 	} else if (cruft) {
 		read_cruft_objects();
 	} else if (!use_internal_rev_list) {

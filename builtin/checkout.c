@@ -15,6 +15,7 @@
 #include "hex.h"
 #include "hook.h"
 #include "merge-ll.h"
+#include "merge.h"
 #include "lockfile.h"
 #include "mem-pool.h"
 #include "object-file.h"
@@ -310,9 +311,36 @@ static int checkout_stage(int stage, const struct cache_entry *ce, int pos,
 		return error(_("path '%s' does not have their version"), ce->name);
 }
 
+struct checkout_merged_data {
+	int conflict_style;
+	int renormalize;
+	char *base_label, *ours_label, *theirs_label;
+};
+
+static void checkout_merged_release(struct checkout_merged_data *data)
+{
+	free(data->base_label);
+	free(data->ours_label);
+	free(data->theirs_label);
+}
+
+static void checkout_merged_prepare(struct checkout_merged_data *data)
+{
+	int renormalize = 0;
+
+	repo_config_get_bool(the_repository, "merge.renormalize", &renormalize);
+	data->renormalize = renormalize;
+	if (read_merge_labels(the_repository, &data->base_label, &data->ours_label,
+			      &data->theirs_label)) {
+		data->base_label = xstrdup("base");
+		data->ours_label = xstrdup("ours");
+		data->theirs_label = xstrdup("theirs");
+	}
+}
+
 static int checkout_merged(int pos, const struct checkout *state,
 			   int *nr_checkouts, struct mem_pool *ce_mem_pool,
-			   int conflict_style)
+			   struct checkout_merged_data *data)
 {
 	struct cache_entry *ce = the_repository->index->cache[pos];
 	const char *path = ce->name;
@@ -320,11 +348,10 @@ static int checkout_merged(int pos, const struct checkout *state,
 	enum ll_merge_result merge_status;
 	int status;
 	struct object_id oid;
-	mmbuffer_t result_buf;
+	mmfile_t result_buf;
 	struct object_id threeway[3];
 	unsigned mode = 0;
 	struct ll_merge_options ll_opts = LL_MERGE_OPTIONS_INIT;
-	int renormalize = 0;
 
 	memset(threeway, 0, sizeof(threeway));
 	while (pos < the_repository->index->cache_nr) {
@@ -345,11 +372,10 @@ static int checkout_merged(int pos, const struct checkout *state,
 	read_mmblob(&ours, the_repository->objects, &threeway[1]);
 	read_mmblob(&theirs, the_repository->objects, &threeway[2]);
 
-	repo_config_get_bool(the_repository, "merge.renormalize", &renormalize);
-	ll_opts.renormalize = renormalize;
-	ll_opts.conflict_style = conflict_style;
-	merge_status = ll_merge(&result_buf, path, &ancestor, "base",
-				&ours, "ours", &theirs, "theirs",
+	ll_opts.renormalize = data->renormalize;
+	ll_opts.conflict_style = data->conflict_style;
+	merge_status = ll_merge(&result_buf, path, &ancestor, data->base_label,
+				&ours, data->ours_label, &theirs, data->theirs_label,
 				state->istate, &ll_opts);
 	free(ancestor.ptr);
 	free(ours.ptr);
@@ -446,6 +472,7 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	int pos;
 	int pc_workers, pc_threshold;
 	struct mem_pool ce_mem_pool;
+	struct checkout_merged_data checkout_merged_data = {0};
 
 	state.force = 1;
 	state.refresh_cache = 1;
@@ -462,6 +489,10 @@ static int checkout_worktree(const struct checkout_opts *opts,
 	if (pc_workers > 1)
 		init_parallel_checkout();
 
+	if (opts->merge) {
+		checkout_merged_prepare(&checkout_merged_data);
+		checkout_merged_data.conflict_style = opts->conflict_style;
+	}
 	for (pos = 0; pos < the_repository->index->cache_nr; pos++) {
 		struct cache_entry *ce = the_repository->index->cache[pos];
 		if (ce->ce_flags & CE_MATCHED) {
@@ -479,10 +510,14 @@ static int checkout_worktree(const struct checkout_opts *opts,
 				errs |= checkout_merged(pos, &state,
 							&nr_unmerged,
 							&ce_mem_pool,
-							opts->conflict_style);
+							&checkout_merged_data);
 			pos = skip_same_name(ce, pos) - 1;
 		}
 	}
+
+	if (opts->merge)
+		checkout_merged_release(&checkout_merged_data);
+
 	if (pc_workers > 1)
 		errs |= run_parallel_checkout(&state, pc_workers, pc_threshold,
 					      NULL, NULL);
@@ -805,7 +840,7 @@ static void setup_branch_path(struct branch_info *branch)
 			   &branch->oid, &branch->refname, 0))
 		repo_get_oid_committish(the_repository, branch->name, &branch->oid);
 
-	copy_branchname(&buf, branch->name, INTERPRET_BRANCH_LOCAL);
+	copy_branchname(the_repository, &buf, branch->name, INTERPRET_BRANCH_LOCAL);
 	if (strcmp(buf.buf, branch->name)) {
 		free(branch->name);
 		branch->name = xstrdup(buf.buf);
@@ -921,7 +956,7 @@ static int merge_working_tree(const struct checkout_opts *opts,
 		}
 	}
 
-	if (!cache_tree_fully_valid(the_repository->index->cache_tree))
+	if (!cache_tree_fully_valid(the_repository->index))
 		cache_tree_update(the_repository->index, WRITE_TREE_SILENT | WRITE_TREE_REPAIR);
 
 	if (write_locked_index(the_repository->index, &lock_file, COMMIT_LOCK))
@@ -946,10 +981,13 @@ static void report_tracking(struct branch_info *new_branch_info)
 
 static void update_refs_for_switch(const struct checkout_opts *opts,
 				   struct branch_info *old_branch_info,
-				   struct branch_info *new_branch_info)
+				   struct branch_info *new_branch_info,
+				   bool merge_conflicts)
 {
 	struct strbuf msg = STRBUF_INIT;
 	const char *old_desc, *reflog_msg;
+	unsigned flags = 0;
+
 	if (opts->new_branch) {
 		if (opts->new_orphan_branch) {
 			enum log_refs_config log_all_ref_updates = LOG_REFS_UNSET;
@@ -979,6 +1017,12 @@ static void update_refs_for_switch(const struct checkout_opts *opts,
 			free(refname);
 		}
 		else
+			/*
+			 * Not fatal: the error and hint have already been
+			 * shown, and like "push -u" and "clone" we finish
+			 * the switch instead of leaving HEAD on the old
+			 * branch with the worktree already updated.
+			 */
 			create_branch(the_repository,
 				      opts->new_branch, new_branch_info->name,
 				      opts->new_branch_force ? 1 : 0,
@@ -1044,7 +1088,11 @@ static void update_refs_for_switch(const struct checkout_opts *opts,
 						   old_branch_info->path);
 		}
 	}
-	remove_branch_state(the_repository, !opts->quiet);
+	if (!opts->quiet)
+		flags |= REMOVE_BRANCH_STATE_VERBOSE;
+	if (merge_conflicts)
+		flags |= REMOVE_BRANCH_STATE_PRESERVE_CONFLICT_LABELS;
+	remove_branch_state(the_repository, flags);
 	strbuf_release(&msg);
 	if (!opts->quiet &&
 	    !opts->force_detach &&
@@ -1085,7 +1133,9 @@ static void suggest_reattach(struct commit *commit, struct rev_info *revs)
 		if (more == 1)
 			describe_one_orphan(&sb, last);
 		else
-			strbuf_addf(&sb, _(" ... and %d more.\n"), more);
+			strbuf_addf(&sb, Q_(" ... and %d more.\n",
+					    " ... and %d more.\n",
+					    more), more);
 	}
 
 	fprintf(stderr,
@@ -1166,6 +1216,7 @@ static int switch_branches(const struct checkout_opts *opts,
 	int flag, writeout_error = 0;
 	int do_merge = 1;
 	int created_autostash = 0;
+	enum stash_apply_result autostash_res = STASH_APPLY_CLEAN;
 	struct strbuf old_commit_shortname = STRBUF_INIT;
 	struct strbuf autostash_msg = STRBUF_INIT;
 	const char *stash_label_base = NULL;
@@ -1237,12 +1288,12 @@ static int switch_branches(const struct checkout_opts *opts,
 				git_config_push_parameter(cfg.buf);
 				strbuf_release(&cfg);
 			}
-			apply_autostash_ref(the_repository,
-					    "CHECKOUT_AUTOSTASH_HEAD",
-					    new_branch_info->name,
-					    "local",
-					    stash_label_base,
-					    autostash_msg.buf);
+			autostash_res = apply_autostash_ref(the_repository,
+				    "CHECKOUT_AUTOSTASH_HEAD",
+				    new_branch_info->name,
+				    "local",
+				    stash_label_base,
+				    autostash_msg.buf);
 		}
 		if (ret) {
 			branch_info_release(&old_branch_info);
@@ -1255,7 +1306,11 @@ static int switch_branches(const struct checkout_opts *opts,
 	if (!opts->quiet && !old_branch_info.path && old_branch_info.commit && new_branch_info->commit != old_branch_info.commit)
 		orphaned_commit_warning(old_branch_info.commit, new_branch_info->commit);
 
-	update_refs_for_switch(opts, &old_branch_info, new_branch_info);
+	if (autostash_res == STASH_APPLY_CONFLICT && !opts->quiet)
+		fputc('\n', stderr);
+
+	update_refs_for_switch(opts, &old_branch_info, new_branch_info,
+			       autostash_res == STASH_APPLY_CONFLICT);
 
 	if (created_autostash) {
 		discard_index(the_repository->index);
@@ -1343,13 +1398,51 @@ enum checkout_command {
 	CHECKOUT_RESTORE = 3,
 };
 
+static void advise_disambiguating_remotes(enum checkout_command which_command,
+					  const char *branch,
+					  const struct string_list *matched_remote_names)
+{
+	const char *cmdname;
+	struct string_list_item *item;
+
+	switch (which_command) {
+	case CHECKOUT_CHECKOUT:
+		cmdname = "checkout";
+		break;
+	case CHECKOUT_SWITCH:
+		cmdname = "switch";
+		break;
+	default:
+		BUG("command <%d> should not reach advise_disambiguating_remotes",
+		    which_command);
+		break;
+	}
+
+	advise(_("Branch name '%s' appears in multiple remotes:"), branch);
+	for_each_string_list_item(item, matched_remote_names) {
+		advise(_("  %s"), item->string);
+	}
+	advise(_("If you meant to check out a remote tracking branch on <remote>,\n"
+		 "you can do so by fully qualifying the name with the --track option:\n"
+		 "\n"
+		 "    git %s --track <remote>/%s\n"
+		 "\n"
+		 "If you'd like to always have checkouts of an ambiguous name prefer\n"
+		 "one remote, e.g. the 'origin' remote, consider setting\n"
+		 "checkout.defaultRemote=origin in your config."),
+	       cmdname, branch);
+}
+
 static char *parse_remote_branch(const char *arg,
 				 struct object_id *rev,
 				 int could_be_checkout_paths,
 				 enum checkout_command which_command)
 {
 	int num_matches = 0;
-	char *remote = unique_tracking_name(arg, rev, &num_matches);
+	struct string_list matched_remote_names = STRING_LIST_INIT_DUP;
+
+	char *remote = unique_tracking_name(arg, rev, &num_matches,
+					    &matched_remote_names);
 
 	if (remote && could_be_checkout_paths) {
 		die(_("'%s' could be both a local file and a tracking branch.\n"
@@ -1358,36 +1451,14 @@ static char *parse_remote_branch(const char *arg,
 	}
 
 	if (!remote && num_matches > 1) {
-	    if (advice_enabled(ADVICE_CHECKOUT_AMBIGUOUS_REMOTE_BRANCH_NAME)) {
-		    const char *cmdname;
-
-		    switch (which_command) {
-		    case CHECKOUT_CHECKOUT:
-			    cmdname = "checkout";
-			    break;
-		    case CHECKOUT_SWITCH:
-			    cmdname = "switch";
-			    break;
-		    default:
-			    BUG("command <%d> should not reach parse_remote_branch",
-				which_command);
-			    break;
-		    }
-
-		    advise(_("If you meant to check out a remote tracking branch on, e.g. 'origin',\n"
-			     "you can do so by fully qualifying the name with the --track option:\n"
-			     "\n"
-			     "    git %s --track origin/<name>\n"
-			     "\n"
-			     "If you'd like to always have checkouts of an ambiguous <name> prefer\n"
-			     "one remote, e.g. the 'origin' remote, consider setting\n"
-			     "checkout.defaultRemote=origin in your config."),
-			   cmdname);
-	    }
-
-	    die(_("'%s' matched multiple (%d) remote tracking branches"),
-		arg, num_matches);
+		if (advice_enabled(ADVICE_CHECKOUT_AMBIGUOUS_REMOTE_BRANCH_NAME))
+			advise_disambiguating_remotes(which_command, arg,
+						      &matched_remote_names);
+		die(_("'%s' matched multiple (%d) remote tracking branches"),
+		    arg, num_matches);
 	}
+
+	string_list_clear(&matched_remote_names, 0);
 
 	return remote;
 }
@@ -1470,7 +1541,9 @@ static int parse_branchname_arg(int argc, const char **argv,
 	else if (dash_dash_pos == 1)
 		has_dash_dash = 1; /* case (3) or (1) */
 	else if (dash_dash_pos >= 2)
-		die(_("only one reference expected, %d given."), dash_dash_pos);
+		die(Q_("only one reference expected, %d given.",
+		       "only one reference expected, %d given.",
+		       dash_dash_pos), dash_dash_pos);
 	opts->count_checkout_paths = !opts->quiet && !has_dash_dash;
 
 	if (!strcmp(arg, "-"))

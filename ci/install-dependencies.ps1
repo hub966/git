@@ -1,5 +1,6 @@
 param(
-    [string]$DownloadDirectory = '.dependencies'
+    [string]$DownloadDirectory = '.dependencies',
+    [switch]$Mingw
 )
 
 $ErrorActionPreference = 'Stop'
@@ -11,7 +12,9 @@ $RustVersion = '1.96.0'
 
 New-Item -Path $DownloadDirectory -ItemType Directory -Force | Out-Null
 New-Item -Path .git/info -ItemType Directory -Force | Out-Null
-New-Item -Path .git/info/exclude -ItemType File -Force | Out-Null
+if (-not (Test-Path .git/info/exclude)) {
+    New-Item -Path .git/info/exclude -ItemType File | Out-Null
+}
 Add-Content -Path .git/info/exclude -Value "/$DownloadDirectory"
 
 function Get-Installer {
@@ -41,6 +44,17 @@ function Invoke-Installer {
     }
 }
 
+$rustTarget = if ($Mingw) { 'gnu' } else { 'msvc' }
+$rustMsi = Get-Installer "rust-$rustTarget.msi" (
+    "https://static.rust-lang.org/dist/" +
+    "rust-$RustVersion-x86_64-pc-windows-$rustTarget.msi")
+Invoke-Installer msiexec.exe @('/i', $rustMsi, 'INSTALLDIR=C:\Rust',
+    "ADDLOCAL=Rustc,Cargo,Std$(if ($Mingw) { ',Gcc' })", '/quiet', '/norestart')
+
+if ($Mingw) {
+    return
+}
+
 $gitAssetVersion = $GitVersion -replace '\.windows\.\d+$', ''
 $gitInstaller = Get-Installer "Git-Installer.exe" `
     "https://github.com/git-for-windows/git/releases/download/v$GitVersion/PortableGit-$gitAssetVersion-64-bit.7z.exe"
@@ -50,6 +64,10 @@ $mesonMsi = Get-Installer "meson.msi" `
     "https://github.com/mesonbuild/meson/releases/download/$MesonVersion/meson-$MesonVersion-64.msi"
 Invoke-Installer msiexec.exe @('/i', $mesonMsi, 'INSTALLDIR=C:\Meson', '/quiet', '/norestart')
 
-$rustMsi = Get-Installer "rust.msi" `
-    "https://static.rust-lang.org/dist/rust-$RustVersion-x86_64-pc-windows-msvc.msi"
-Invoke-Installer msiexec.exe @('/i', $rustMsi, 'INSTALLDIR=C:\Rust', 'ADDLOCAL=Rustc,Cargo,Std', '/quiet', '/norestart')
+# Disable Git Credential Manager, which is auto-configured by PortableGit.
+# GitLab's runner picks up this Git in its cleanup stage and runs `git
+# credential reject`, which hangs in GCM and makes the job time out.
+& "C:\Program Files\Git\bin\git.exe" config unset --all --system credential.helper
+if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 5) {
+    throw "Failed to unset credential.helper with exit code $LASTEXITCODE"
+}

@@ -30,7 +30,6 @@ clar_test_suites = [
 ]
 
 clar_sources = [
-  'unit-tests/clar/clar.c',
   'unit-tests/unit-test.c',
   'unit-tests/lib-oid.c',
   'unit-tests/lib-reftable.c'
@@ -49,7 +48,7 @@ clar_decls_h = custom_target(
 )
 clar_sources += clar_decls_h
 
-clar_sources += custom_target(
+clar_suite_h = custom_target(
   input: clar_decls_h,
   output: 'clar.suite',
   command : [
@@ -66,6 +65,13 @@ clar_unit_tests = executable('unit-tests',
   c_args: [
     '-DGIT_CLAR_DECLS_H="' + clar_decls_h.full_path() + '"',
   ],
+  c_pch: '../tools/precompiled.h',
+  link_with: static_library('clar',
+    sources: [
+      'unit-tests/clar/clar.c',
+      clar_suite_h,
+    ],
+  ),
   dependencies: [libgit_commonmain],
 )
 test('unit-tests', clar_unit_tests, kwargs: test_kwargs)
@@ -171,6 +177,7 @@ integration_tests = [
   't1014-read-tree-confusing.sh',
   't1015-read-index-unmerged.sh',
   't1016-compatObjectFormat.sh',
+  't1017-cat-file-remote-object-info.sh',
   't1020-subdirectory.sh',
   't1022-read-tree-partial-clone.sh',
   't1050-large.sh',
@@ -304,6 +311,7 @@ integration_tests = [
   't2204-add-ignored.sh',
   't2205-add-worktree-config.sh',
   't2206-add-submodule-ignored.sh',
+  't2207-add-resolved.sh',
   't2300-cd-to-toplevel.sh',
   't2400-worktree-add.sh',
   't2401-worktree-prune.sh',
@@ -405,6 +413,7 @@ integration_tests = [
   't3452-history-split.sh',
   't3453-history-fixup.sh',
   't3454-history-drop.sh',
+  't3455-history-squash.sh',
   't3500-cherry.sh',
   't3501-revert-cherry-pick.sh',
   't3502-cherry-pick-merge.sh',
@@ -582,6 +591,7 @@ integration_tests = [
   't4215-log-skewed-merges.sh',
   't4216-log-bloom.sh',
   't4217-log-limit.sh',
+  't4218-log-graph-indentation.sh',
   't4219-log-follow-merge.sh',
   't4252-am-options.sh',
   't4253-am-keep-cr-dos.sh',
@@ -649,6 +659,8 @@ integration_tests = [
   't5409-colorize-remote-messages.sh',
   't5410-receive-pack.sh',
   't5411-proc-receive-hook.sh',
+  't5412-receive-report-hook.sh',
+  't5413-connectivity-check.sh',
   't5500-fetch-pack.sh',
   't5501-fetch-push-alternates.sh',
   't5502-quickfetch.sh',
@@ -714,6 +726,7 @@ integration_tests = [
   't5564-http-proxy.sh',
   't5565-push-multiple.sh',
   't5566-push-group.sh',
+  't5567-one-time-script.sh',
   't5570-git-daemon.sh',
   't5571-pre-push-hook.sh',
   't5572-pull-submodule.sh',
@@ -793,6 +806,7 @@ integration_tests = [
   't6041-bisect-submodule.sh',
   't6050-replace.sh',
   't6060-merge-index.sh',
+  't6099-merge-base-side-exhaustion.sh',
   't6100-rev-list-in-order.sh',
   't6101-rev-parse-parents.sh',
   't6102-rev-list-unexpected-objects.sh',
@@ -962,6 +976,7 @@ integration_tests = [
   't7703-repack-geometric.sh',
   't7704-repack-cruft.sh',
   't7705-repack-incremental-midx.sh',
+  't7706-repack-drop-filtered.sh',
   't7800-difftool.sh',
   't7810-grep.sh',
   't7811-grep-open.sh',

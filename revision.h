@@ -314,6 +314,8 @@ struct rev_info {
 	/* Display history graph */
 	struct git_graph *graph;
 	int graph_max_lanes;
+	unsigned int no_graph_indent:1;
+	unsigned int graph_indent_set:1;
 
 	/* special limits */
 	int skip_count;
@@ -394,6 +396,14 @@ struct rev_info {
 
 	/* Missing commits to be tracked without failing traversal. */
 	struct oidset missing_commits;
+
+	/*
+	 * Strings whose ownership has been handed over to us, but which
+	 * we may be referencing in any of the above options (including
+	 * within the diffopt struct). These will remain valid until
+	 * release_revisions() is called.
+	 */
+	struct strvec argv_to_free;
 };
 
 /**
@@ -431,6 +441,7 @@ struct rev_info {
 	.commit_format = CMIT_FMT_DEFAULT, \
 	.expand_tabs_in_log_default = 8, \
 	.rdiff_log_arg = STRVEC_INIT, \
+	.argv_to_free = STRVEC_INIT, \
 }
 
 /**

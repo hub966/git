@@ -2,6 +2,7 @@
 #include "../abspath.h"
 #include "../chdir-notify.h"
 #include "../config.h"
+#include "../date.h"
 #include "../dir.h"
 #include "../environment.h"
 #include "../fsck.h"
@@ -84,7 +85,8 @@ static int reftable_backend_read_ref(struct reftable_backend *be,
 	if (ret)
 		goto done;
 
-	if (strcmp(ref.refname, refname)) {
+	if (strcmp(ref.refname, refname) ||
+	    reftable_ref_record_is_deletion(&ref)) {
 		ret = 1;
 		goto done;
 	}
@@ -110,7 +112,6 @@ static int reftable_backend_read_ref(struct reftable_backend *be,
 		oidread(oid, reftable_ref_record_val1(&ref),
 			&hash_algos[hash_id]);
 	} else {
-		/* We got a tombstone, which should not happen. */
 		BUG("unhandled reference value type %d", ref.value_type);
 	}
 
@@ -317,7 +318,7 @@ static void fill_reftable_log_record(struct reftable_log_record *log, const stru
 		tz_begin++;
 	}
 
-	log->value.update.tz_offset = sign * atoi(tz_begin);
+	log->value.update.tz_offset = tz_to_minutes(sign * atoi(tz_begin));
 }
 
 static int reftable_be_config(const char *var, const char *value,
@@ -391,8 +392,7 @@ static const struct reftable_be_write_options *reftable_be_write_options(struct 
 	return opts;
 }
 
-static void reftable_be_reparent(const char *name UNUSED,
-				 const char *old_cwd,
+static void reftable_be_reparent(const char *old_cwd,
 				 const char *new_cwd,
 				 void *payload)
 {
@@ -465,7 +465,7 @@ static struct ref_store *reftable_be_init(struct repository *repo,
 			goto done;
 	}
 
-	chdir_notify_register(NULL, reftable_be_reparent, refs);
+	chdir_notify_register(reftable_be_reparent, refs);
 
 done:
 	assert(refs->err != REFTABLE_API_ERROR);
@@ -492,7 +492,7 @@ static void reftable_be_release(struct ref_store *ref_store)
 		free(be);
 	}
 	strmap_clear(&refs->worktree_backends, 0);
-	chdir_notify_unregister(NULL, reftable_be_reparent, refs);
+	chdir_notify_unregister(reftable_be_reparent, refs);
 }
 
 static int reftable_be_create_on_disk(struct ref_store *ref_store,
@@ -651,6 +651,9 @@ static int reftable_ref_iterator_advance(struct ref_iterator *ref_iterator)
 			iter->err = 1;
 			break;
 		}
+
+		if (iter->ref.value_type == REFTABLE_REF_DELETION)
+			continue;
 
 		if (iter->exclude_patterns && should_exclude_current_ref(iter))
 			continue;
@@ -999,9 +1002,8 @@ static int prepare_transaction_update(struct write_transaction_table_arg **out,
 	if (!arg) {
 		struct reftable_addition *addition;
 
-		ret = reftable_stack_new_addition(&addition, be->stack,
-						  &reftable_be_write_options(refs)->opts,
-						  REFTABLE_STACK_NEW_ADDITION_RELOAD);
+		ret = reftable_stack_addition_new(&addition, be->stack,
+						  &reftable_be_write_options(refs)->opts);
 		if (ret) {
 			if (ret == REFTABLE_LOCK_ERROR)
 				strbuf_addstr(err, "cannot lock references");
@@ -1532,6 +1534,8 @@ static int write_transaction_table(struct reftable_writer *writer, void *cb_data
 					ret = 0;
 					break;
 				}
+				if (reftable_log_record_is_deletion(&log))
+					continue;
 
 				ALLOC_GROW(logs, logs_nr + 1, logs_alloc);
 				tombstone = &logs[logs_nr++];
@@ -1929,6 +1933,8 @@ static int write_copy_table(struct reftable_writer *writer, void *cb_data)
 			ret = 0;
 			break;
 		}
+		if (reftable_log_record_is_deletion(&old_log))
+			continue;
 
 		free(old_log.refname);
 
@@ -2003,8 +2009,7 @@ static int reftable_be_rename_ref(struct ref_store *ref_store,
 	if (ret)
 		goto done;
 	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg,
-				 &reftable_be_write_options(refs)->opts,
-				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
+				 &reftable_be_write_options(refs)->opts);
 
 done:
 	assert(ret != REFTABLE_API_ERROR);
@@ -2034,8 +2039,7 @@ static int reftable_be_copy_ref(struct ref_store *ref_store,
 	if (ret)
 		goto done;
 	ret = reftable_stack_add(arg.be->stack, &write_copy_table, &arg,
-				 &reftable_be_write_options(refs)->opts,
-				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
+				 &reftable_be_write_options(refs)->opts);
 
 done:
 	assert(ret != REFTABLE_API_ERROR);
@@ -2060,6 +2064,9 @@ static int reftable_reflog_iterator_advance(struct ref_iterator *ref_iterator)
 		iter->err = reftable_iterator_next_log(&iter->iter, &iter->log);
 		if (iter->err)
 			break;
+
+		if (reftable_log_record_is_deletion(&iter->log))
+			continue;
 
 		/*
 		 * We want the refnames that we have reflogs for, so we skip if
@@ -2180,7 +2187,7 @@ static int yield_log_record(struct reftable_ref_store *refs,
 	full_committer = fmt_ident(log->value.update.name, log->value.update.email,
 				   WANT_COMMITTER_IDENT, NULL, IDENT_NO_DATE);
 	return fn(log->refname, &old_oid, &new_oid, full_committer,
-		  log->value.update.time, log->value.update.tz_offset,
+		  log->value.update.time, minutes_to_tz(log->value.update.tz_offset),
 		  log->value.update.message, cb_data);
 }
 
@@ -2220,6 +2227,8 @@ static int reftable_be_for_each_reflog_ent_reverse(struct ref_store *ref_store,
 			ret = 0;
 			break;
 		}
+		if (reftable_log_record_is_deletion(&log))
+			continue;
 
 		ret = yield_log_record(refs, &log, fn, cb_data);
 		if (ret)
@@ -2272,6 +2281,10 @@ static int reftable_be_for_each_reflog_ent(struct ref_store *ref_store,
 			ret = 0;
 			break;
 		}
+		if (reftable_log_record_is_deletion(&log)) {
+			reftable_log_record_release(&log);
+			continue;
+		}
 
 		ALLOC_GROW(logs, logs_nr + 1, logs_alloc);
 		logs[logs_nr++] = log;
@@ -2318,18 +2331,26 @@ static int reftable_be_reflog_exists(struct ref_store *ref_store,
 		goto done;
 
 	/*
-	 * Check whether we get at least one log record for the given ref name.
-	 * If so, the reflog exists, otherwise it doesn't.
+	 * Check whether we get at least one non-deleted log record for the
+	 * given ref name.  If so, the reflog exists, otherwise it doesn't.
 	 */
-	ret = reftable_iterator_next_log(&it, &log);
-	if (ret < 0)
-		goto done;
-	if (ret > 0) {
-		ret = 0;
-		goto done;
+	while (1) {
+		ret = reftable_iterator_next_log(&it, &log);
+		if (ret < 0)
+			goto done;
+		if (ret > 0) {
+			ret = 0;
+			goto done;
+		}
+		if (strcmp(log.refname, refname)) {
+			ret = 0;
+			goto done;
+		}
+		if (!reftable_log_record_is_deletion(&log))
+			break;
 	}
 
-	ret = strcmp(log.refname, refname) == 0;
+	ret = 1;
 
 done:
 	reftable_iterator_destroy(&it);
@@ -2400,8 +2421,7 @@ static int reftable_be_create_reflog(struct ref_store *ref_store,
 	arg.stack = be->stack;
 
 	ret = reftable_stack_add(be->stack, &write_reflog_existence_table, &arg,
-				 &reftable_be_write_options(refs)->opts,
-				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
+				 &reftable_be_write_options(refs)->opts);
 
 done:
 	return ret;
@@ -2442,6 +2462,8 @@ static int write_reflog_delete_table(struct reftable_writer *writer, void *cb_da
 			ret = 0;
 			break;
 		}
+		if (reftable_log_record_is_deletion(&log))
+			continue;
 
 		tombstone.refname = (char *)arg->refname;
 		tombstone.value_type = REFTABLE_LOG_DELETION;
@@ -2473,8 +2495,7 @@ static int reftable_be_delete_reflog(struct ref_store *ref_store,
 	arg.stack = be->stack;
 
 	ret = reftable_stack_add(be->stack, &write_reflog_delete_table, &arg,
-				 &reftable_be_write_options(refs)->opts,
-				 REFTABLE_STACK_NEW_ADDITION_RELOAD);
+				 &reftable_be_write_options(refs)->opts);
 
 	assert(ret != REFTABLE_API_ERROR);
 	return ret;
@@ -2595,9 +2616,8 @@ static int reftable_be_reflog_expire(struct ref_store *ref_store,
 	if (ret < 0)
 		goto done;
 
-	ret = reftable_stack_new_addition(&add, be->stack,
-					  &reftable_be_write_options(refs)->opts,
-					  REFTABLE_STACK_NEW_ADDITION_RELOAD);
+	ret = reftable_stack_addition_new(&add, be->stack,
+					  &reftable_be_write_options(refs)->opts);
 	if (ret < 0)
 		goto done;
 
@@ -2624,6 +2644,10 @@ static int reftable_be_reflog_expire(struct ref_store *ref_store,
 		if (ret > 0 || strcmp(log.refname, refname)) {
 			reftable_log_record_release(&log);
 			break;
+		}
+		if (reftable_log_record_is_deletion(&log)) {
+			reftable_log_record_release(&log);
+			continue;
 		}
 
 		oidread(&old_oid, log.value.update.old_hash,
@@ -2667,7 +2691,7 @@ static int reftable_be_reflog_expire(struct ref_store *ref_store,
 
 		if (should_prune_fn(&old_oid, &new_oid, logs[i].value.update.email,
 				    (timestamp_t)logs[i].value.update.time,
-				    logs[i].value.update.tz_offset,
+				    minutes_to_tz(logs[i].value.update.tz_offset),
 				    logs[i].value.update.message,
 				    policy_cb_data)) {
 			dest->value_type = REFTABLE_LOG_DELETION;
@@ -2791,6 +2815,8 @@ static int reftable_be_fsck(struct ref_store *ref_store, struct fsck_options *o,
 		report.path = refname.buf;
 
 		switch (ref.value_type) {
+		case REFTABLE_REF_DELETION:
+			continue;
 		case REFTABLE_REF_VAL1:
 		case REFTABLE_REF_VAL2: {
 			struct object_id oid;

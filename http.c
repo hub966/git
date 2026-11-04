@@ -1608,6 +1608,8 @@ struct active_request_slot *get_active_slot(void)
 
 	if (!slot->curl) {
 		slot->curl = curl_easy_duphandle(curl_default);
+		if (!slot->curl)
+			die("curl_easy_duphandle failed");
 		curl_session_count++;
 	}
 
@@ -2313,6 +2315,45 @@ static int http_request(const char *url,
 	return ret;
 }
 
+#ifndef GIT_CURL_HAVE_CURL_URL
+#define strip_url_credential(in) NULL
+#else
+static char *strip_url_credential(const char *in)
+{
+	char *ret = NULL;
+	CURLU *url;
+
+	url = curl_url();
+	if (!url)
+		goto out;
+
+	if (curl_url_set(url, CURLUPART_URL, in, 0))
+		goto out;
+
+	curl_url_set(url, CURLUPART_USER, NULL, 0);
+	curl_url_set(url, CURLUPART_PASSWORD, NULL, 0);
+	curl_url_get(url, CURLUPART_URL, &ret, 0);
+
+out:
+	curl_url_cleanup(url);
+	return ret;
+}
+#endif
+
+static int match_effective_url(const char *asked, const char *got)
+{
+	char *stripped;
+	int ret;
+
+	if (!strcmp(asked, got))
+		return 1;
+
+	stripped = strip_url_credential(asked);
+	ret = stripped && !strcmp(stripped, got);
+	curl_free(stripped);
+	return ret;
+}
+
 /*
  * Update the "base" url to a more appropriate value, as deduced by
  * redirects seen when requesting a URL starting with "url".
@@ -2345,7 +2386,7 @@ static int update_url_from_redirect(struct strbuf *base,
 	const char *tail;
 	size_t new_len;
 
-	if (!strcmp(asked, got->buf))
+	if (match_effective_url(asked, got->buf))
 		return 0;
 
 	if (!skip_prefix(asked, base->buf, &tail))
@@ -2688,10 +2729,13 @@ int finish_http_pack_request(struct http_pack_request *preq)
 	int tmpfile_fd;
 	int ret = 0;
 
+	/* Another downloader may unlink the staging path while we index it. */
+	tmpfile_fd = xdup(fileno(preq->packfile));
 	fclose(preq->packfile);
 	preq->packfile = NULL;
-
-	tmpfile_fd = xopen(preq->tmpfile.buf, O_RDONLY);
+	if (lseek(tmpfile_fd, 0, SEEK_SET) < 0)
+		die_errno("unable to seek local file %s for pack",
+			  preq->tmpfile.buf);
 
 	ip.git_cmd = 1;
 	ip.in = tmpfile_fd;
@@ -2704,13 +2748,8 @@ int finish_http_pack_request(struct http_pack_request *preq)
 	else
 		ip.no_stdout = 1;
 
-	if (run_command(&ip)) {
+	if (run_command(&ip))
 		ret = -1;
-		goto cleanup;
-	}
-
-cleanup:
-	close(tmpfile_fd);
 	unlink(preq->tmpfile.buf);
 	return ret;
 }
@@ -2718,9 +2757,9 @@ cleanup:
 void http_install_packfile(struct packed_git *p,
 			   struct packfile_list *list_to_remove_from)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
+	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->source);
 	packfile_list_remove(list_to_remove_from, p);
-	packfile_store_add_pack(files->packed, p);
+	packfile_store_add_pack(files->dirs->packed, p);
 }
 
 struct http_pack_request *new_http_pack_request(
@@ -2738,22 +2777,45 @@ struct http_pack_request *new_http_pack_request(
 struct http_pack_request *new_direct_http_pack_request(
 	const unsigned char *packed_git_hash, char *url)
 {
-	off_t prev_posn = 0;
+	off_t prev_posn;
 	struct http_pack_request *preq;
+	int fd;
 
 	CALLOC_ARRAY(preq, 1);
 	strbuf_init(&preq->tmpfile, 0);
-
 	preq->url = url;
 
 	odb_pack_name(the_repository, &preq->tmpfile, packed_git_hash, "pack");
 	strbuf_addstr(&preq->tmpfile, ".temp");
-	preq->packfile = fopen(preq->tmpfile.buf, "a");
-	if (!preq->packfile) {
-		error("Unable to open local file %s for pack",
-		      preq->tmpfile.buf);
+	/*
+	 * MinGW's non-append O_RDWR open grants FILE_SHARE_DELETE only for an
+	 * existing file; reopen a newly created file so others may unlink it.
+	 */
+	for (;;) {
+		fd = open(preq->tmpfile.buf, O_RDWR);
+		if (fd >= 0 || errno != ENOENT)
+			break;
+		fd = open(preq->tmpfile.buf, O_RDWR | O_CREAT | O_EXCL, 0666);
+		if (fd >= 0) {
+			close(fd);
+			continue;
+		}
+		if (errno != EEXIST)
+			break;
+	}
+	if (fd < 0) {
+		error_errno("unable to open local file %s for pack",
+			    preq->tmpfile.buf);
 		goto abort;
 	}
+	prev_posn = lseek(fd, 0, SEEK_END);
+	if (prev_posn < 0) {
+		error_errno("unable to seek local file %s for pack",
+			    preq->tmpfile.buf);
+		close(fd);
+		goto abort;
+	}
+	preq->packfile = xfdopen(fd, "w");
 
 	preq->slot = get_active_slot();
 	preq->headers = object_request_headers();
@@ -2762,12 +2824,7 @@ struct http_pack_request *new_direct_http_pack_request(
 	curl_easy_setopt(preq->slot->curl, CURLOPT_URL, preq->url);
 	curl_easy_setopt(preq->slot->curl, CURLOPT_HTTPHEADER, preq->headers);
 
-	/*
-	 * If there is data present from a previous transfer attempt,
-	 * resume where it left off
-	 */
-	prev_posn = ftello(preq->packfile);
-	if (prev_posn>0) {
+	if (prev_posn > 0) {
 		if (http_is_verbose)
 			fprintf(stderr,
 				"Resuming fetch of pack %s at byte %"PRIuMAX"\n",
@@ -2828,7 +2885,7 @@ static size_t fwrite_sha1_file(char *ptr, size_t eltsize, size_t nmemb,
 struct http_object_request *new_http_object_request(const char *base_url,
 						    const struct object_id *oid)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
+	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->source);
 	char *hex = oid_to_hex(oid);
 	struct strbuf filename = STRBUF_INIT;
 	struct strbuf prevfile = STRBUF_INIT;
@@ -2843,7 +2900,7 @@ struct http_object_request *new_http_object_request(const char *base_url,
 	oidcpy(&freq->oid, oid);
 	freq->localfile = -1;
 
-	odb_loose_path(files->loose, &filename, oid);
+	odb_loose_path(files->dirs->loose, &filename, oid);
 	strbuf_addf(&freq->tmpfile, "%s.temp", filename.buf);
 
 	strbuf_addf(&prevfile, "%s.prev", filename.buf);
@@ -2969,7 +3026,7 @@ void process_http_object_request(struct http_object_request *freq)
 
 int finish_http_object_request(struct http_object_request *freq)
 {
-	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->sources);
+	struct odb_source_files *files = odb_source_files_downcast(the_repository->objects->source);
 	struct stat st;
 	struct strbuf filename = STRBUF_INIT;
 
@@ -2996,7 +3053,7 @@ int finish_http_object_request(struct http_object_request *freq)
 		unlink_or_warn(freq->tmpfile.buf);
 		return -1;
 	}
-	odb_loose_path(files->loose, &filename, &freq->oid);
+	odb_loose_path(files->dirs->loose, &filename, &freq->oid);
 	freq->rename = finalize_object_file(the_repository, freq->tmpfile.buf, filename.buf);
 	strbuf_release(&filename);
 

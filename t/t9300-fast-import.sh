@@ -436,7 +436,7 @@ test_expect_success 'B: accept invalid timezone with raw-permissive' '
 	git init invalid-timezone &&
 	git -C invalid-timezone fast-import --date-format=raw-permissive <input &&
 	git -C invalid-timezone cat-file -p invalid-timezone >out &&
-	grep "1234567890 [+]051800" out
+	test_grep "1234567890 [+]051800" out
 '
 
 test_expect_success 'B: accept and fixup committer with no name' '
@@ -2326,7 +2326,7 @@ test_expect_success 'R: export-marks feature results in a marks file being creat
 	EOF
 
 	git fast-import --allow-unsafe-features <input &&
-	grep :1 git.marks
+	test_grep :1 git.marks
 '
 
 test_expect_success 'R: export-marks options can be overridden by commandline options' '
@@ -2340,7 +2340,7 @@ test_expect_success 'R: export-marks options can be overridden by commandline op
 	EOF
 	git fast-import --allow-unsafe-features \
 			--export-marks=cmdline-sub/other.marks <input &&
-	grep :1 cmdline-sub/other.marks &&
+	test_grep :1 cmdline-sub/other.marks &&
 	test_path_is_missing feature-sub
 '
 
@@ -2825,6 +2825,13 @@ test_expect_success 'R: die on unknown option' '
 
 test_expect_success 'R: unknown commandline options are rejected' '\
 	test_must_fail git fast-import --non-existing-option < /dev/null
+'
+
+test_expect_success 'R: feature-only names are rejected on the command line' '
+	for opt in --alias --get-mark --ls --notes
+	do
+		test_must_fail git fast-import "$opt" </dev/null || return 1
+	done
 '
 
 test_expect_success 'R: die on invalid option argument' '
@@ -3816,9 +3823,9 @@ test_expect_success 'X: replace ref that becomes useless is removed' '
 		sed -e s/othername/somename/ tmp >tmp2 &&
 		git fast-import --force <tmp2 2>msgs &&
 
-		grep "dropping.*since it would point to itself" msgs &&
+		test_grep "dropping.*since it would point to itself" msgs &&
 		git show-ref >refs &&
-		! grep refs/replace refs
+		test_grep ! refs/replace refs
 	)
 '
 
@@ -3928,6 +3935,49 @@ test_expect_success 'Y: rewrite submodules' '
 		git fast-import --rewrite-submodules-from=sub:../Y-marks \
 			--rewrite-submodules-to=sub:sub2-marks <../Y-main-input &&
 		test "$(git rev-parse main)" = "$(test_oid Ymain)"
+	)
+'
+
+test_expect_success 'Y: reference pending tag or commit' '
+	test_oid_cache <<-EOF &&
+	pending_commit sha1:85b46dd918355ff17b4109ec738723d42f235a04
+	pending_commit sha256:17e650f097a4db6fe069c96935360d3ccc9b35c4018728c5f311a4217c2ced3d
+	pending_tag sha1:ec6c4db71feb5f66615214dad2324ce030e777a7
+	pending_tag sha256:85edc5eac315bc680677b2fc71622bd77476f057eb8dc8ed6a497803a24f1f46
+	EOF
+
+	git init reference-pending &&
+	(
+		cd reference-pending &&
+		git fast-import <<-EOF
+		commit refs/heads/main
+		committer A U Thor <author@example.com> 1712563200 +0000
+		data 14
+		commit message
+		M 644 inline test file
+		data 14
+		dummy content
+
+		tag newtag
+		from $(test_oid pending_commit)
+		tagger A U Thor <author@example.com> 1712563300 +0000
+		data 11
+		tag message
+		# no emty line after tag data!
+		reset refs/heads/other
+		from $(test_oid pending_tag)
+
+		commit refs/heads/further
+		committer A U Thor <author@example.com> 1712563400 +0000
+		data 21
+		what about 2nd commit
+		from $(test_oid pending_commit)
+		M 644 inline other test file
+		data 19
+		more dummy content
+
+		done
+		EOF
 	)
 '
 

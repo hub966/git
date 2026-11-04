@@ -15,6 +15,7 @@
 #include "refspec.h"
 #include "object-name.h"
 #include "odb.h"
+#include "odb/source.h"
 #include "oidset.h"
 #include "oid-array.h"
 #include "commit.h"
@@ -96,14 +97,15 @@ static struct string_list deepen_not = STRING_LIST_INIT_NODUP;
 static struct strbuf default_rla = STRBUF_INIT;
 static struct transport *gtransport;
 static struct transport *gsecondary;
-static struct refspec refmap = REFSPEC_INIT_FETCH;
+static struct refspec refmap;
 static struct string_list server_options = STRING_LIST_INIT_DUP;
 static struct string_list negotiation_restrict = STRING_LIST_INIT_NODUP;
 static struct string_list negotiation_include = STRING_LIST_INIT_NODUP;
 
 struct fetch_config {
 	enum display_format display_format;
-	enum follow_remote_head_settings follow_remote_head;
+	char *follow_remote_head_raw;
+	int follow_remote_head_seen;
 	int all;
 	int prune;
 	int prune_tags;
@@ -176,22 +178,29 @@ static int git_fetch_config(const char *k, const char *v,
 	}
 
 	if (!strcmp(k, "fetch.followremotehead")) {
-		if (!v)
-			return config_error_nonbool(k);
-		else if (!strcmp(v, "never"))
-			fetch_config->follow_remote_head = FOLLOW_REMOTE_NEVER;
-		else if (!strcmp(v, "create"))
-			fetch_config->follow_remote_head = FOLLOW_REMOTE_CREATE;
-		else if (!strcmp(v, "warn"))
-			fetch_config->follow_remote_head = FOLLOW_REMOTE_WARN;
-		else if (!strcmp(v, "always"))
-			fetch_config->follow_remote_head = FOLLOW_REMOTE_ALWAYS;
-		else
-			warning(_("unrecognized fetch.followRemoteHEAD value '%s' ignored"), v);
+		free(fetch_config->follow_remote_head_raw);
+		fetch_config->follow_remote_head_raw = xstrdup_or_null(v);
+		fetch_config->follow_remote_head_seen = 1;
 		return 0;
 	}
 
 	return git_default_config(k, v, ctx, cb);
+}
+
+static enum follow_remote_head_settings get_follow_remote_head(const char *setting)
+{
+	if (!setting)
+		die(_("missing value for 'fetch.followRemoteHEAD'"));
+	else if (!strcmp(setting, "never"))
+		return FOLLOW_REMOTE_NEVER;
+	else if (!strcmp(setting, "create"))
+		return FOLLOW_REMOTE_CREATE;
+	else if (!strcmp(setting, "warn"))
+		return FOLLOW_REMOTE_WARN;
+	else if (!strcmp(setting, "always"))
+		return FOLLOW_REMOTE_ALWAYS;
+	warning(_("unrecognized fetch.followRemoteHEAD value '%s' ignored"), setting);
+	return BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
 }
 
 static int parse_refmap_arg(const struct option *opt, const char *arg, int unset)
@@ -601,7 +610,8 @@ static struct ref *get_ref_map(struct remote *remote,
 		struct refspec_item tag_refspec;
 
 		/* also fetch all tags */
-		refspec_item_init_push(&tag_refspec, TAG_REFSPEC);
+		refspec_item_init_push(&tag_refspec, TAG_REFSPEC,
+				       the_hash_algo);
 		get_fetch_map(remote_refs, &tag_refspec, &tail, 0);
 		refspec_item_clear(&tag_refspec);
 	} else if (tags == TAGS_DEFAULT && *autotags) {
@@ -1249,7 +1259,8 @@ static int store_updated_refs(struct display_state *display_state,
 
 		opt.exclude_hidden_refs_section = "fetch";
 		rm = ref_map;
-		if (check_connected(iterate_ref_map, &rm, &opt)) {
+		if (check_connected(the_repository, iterate_ref_map,
+				    &rm, &opt)) {
 			rc = error(_("%s did not send all necessary objects"),
 				   display_state->url);
 			goto abort;
@@ -1421,7 +1432,7 @@ static int check_exist_and_connected(struct ref *ref_map)
 
 	opt.quiet = 1;
 	opt.exclude_hidden_refs_section = "fetch";
-	return check_connected(iterate_ref_map, &rm, &opt);
+	return check_connected(the_repository, iterate_ref_map, &rm, &opt);
 }
 
 static int fetch_and_consume_refs(struct display_state *display_state,
@@ -1839,7 +1850,7 @@ static void ref_transaction_rejection_handler(const char *refname,
 {
 	struct ref_rejection_data *data = cb_data;
 
-	if (err == REF_TRANSACTION_ERROR_CASE_CONFLICT && ignore_case &&
+	if (err == REF_TRANSACTION_ERROR_CASE_CONFLICT && repo_ignore_case(the_repository) &&
 	    !data->case_sensitive_msg_shown) {
 		error(_("You're on a case-insensitive filesystem, and the remote you are\n"
 			"trying to fetch from has references that only differ in casing. It\n"
@@ -1847,7 +1858,7 @@ static void ref_transaction_rejection_handler(const char *refname,
 			"can either accept this as-is, in which case you won't be able to\n"
 			"store all remote references on disk. Or you can alternatively\n"
 			"migrate your repository to use the 'reftable' backend with the\n"
-			"following command:\n\n    git refs migrate --ref-format=reftable\n\n"
+			"following command:\n\n    git refs migrate --ref-storage-format=reftable\n\n"
 			"Please keep in mind that not all implementations of Git support this\n"
 			"new format yet. So if you use tools other than Git to access this\n"
 			"repository it may not be an option to migrate to reftables.\n"));
@@ -1902,10 +1913,34 @@ out:
 	return retcode;
 }
 
+static void collect_updated_tips(struct oidset *tips, struct ref *ref_map)
+{
+	struct ref *rm;
+	for (rm = ref_map; rm; rm = rm->next) {
+		struct commit *commit;
+		/*
+		 * Shallow-rejected refs are not stored and their history
+		 * is incomplete, so skip them.
+		 */
+		if (rm->status == REF_STATUS_REJECT_SHALLOW)
+			continue;
+		if (is_null_oid(&rm->old_oid))
+			continue;
+		if (rm->peer_ref &&
+		    oideq(&rm->old_oid, &rm->peer_ref->old_oid))
+			continue;
+		commit = lookup_commit_reference_gently(the_repository,
+							&rm->old_oid, 1);
+		if (commit)
+			oidset_insert(tips, &commit->object.oid);
+	}
+}
+
 static int do_fetch(struct transport *transport,
 		    struct refspec *rs,
 		    const struct fetch_config *config,
-		    struct list_objects_filter_options *filter_options)
+		    struct list_objects_filter_options *filter_options,
+		    struct oidset *updated_tips)
 {
 	struct ref_transaction *transaction = NULL;
 	struct ref *ref_map = NULL;
@@ -1917,11 +1952,10 @@ static int do_fetch(struct transport *transport,
 		TRANSPORT_LS_REFS_OPTIONS_INIT;
 	struct fetch_head fetch_head = { 0 };
 	struct strbuf err = STRBUF_INIT;
-	int do_set_head = 0;
 	struct ref_update_display_info_array display_array = { 0 };
 	struct strmap rejected_refs = STRMAP_INIT;
 	int summary_width = 0;
-	int follow_remote_head;
+	int follow_remote_head = FOLLOW_REMOTE_NEVER;
 
 	if (tags == TAGS_DEFAULT) {
 		if (transport->remote->fetch_tags == 2)
@@ -1937,22 +1971,6 @@ static int do_fetch(struct transport *transport,
 			goto cleanup;
 	}
 
-	/*
-	 * NEEDSWORK: By the time this function executes, we have already parsed
-	 * all such followRemoteHEAD values from the external configuration,
-	 * potentially emitting warning messages for bogus values.  Ideally, if
-	 * this fetch ends up not needing to consult these values, then git would
-	 * not ever output a value warning. (eg: when pulling from a URL directly -
-	 * rather than a configured remote, or when a remote's followRemoteHEAD
-	 * overrides the fallback fetch setting)
-	 */
-	if (transport->remote->follow_remote_head)
-		follow_remote_head = transport->remote->follow_remote_head;
-	else if (config->follow_remote_head)
-		follow_remote_head = config->follow_remote_head;
-	else
-		follow_remote_head = BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
-
 	if (rs->nr) {
 		refspec_ref_prefixes(rs, &transport_ls_refs_options.ref_prefixes);
 	} else {
@@ -1961,8 +1979,16 @@ static int do_fetch(struct transport *transport,
 		if (transport->remote->fetch.nr) {
 			refspec_ref_prefixes(&transport->remote->fetch,
 					     &transport_ls_refs_options.ref_prefixes);
-			if (follow_remote_head != FOLLOW_REMOTE_NEVER)
-				do_set_head = 1;
+			/*
+			 * See remote.c's handling of remote.<name>.followRemoteHEAD
+			 * for the analogous, still-unresolved case.
+			 */
+			if (transport->remote->follow_remote_head)
+				follow_remote_head = transport->remote->follow_remote_head;
+			else if (config->follow_remote_head_seen)
+				follow_remote_head = get_follow_remote_head(config->follow_remote_head_raw);
+			else
+				follow_remote_head = BUILTIN_FOLLOW_REMOTE_HEAD_DFLT;
 		}
 		if (branch && branch_has_merge_config(branch) &&
 		    !strcmp(branch->remote_name, transport->remote->name)) {
@@ -1986,7 +2012,7 @@ static int do_fetch(struct transport *transport,
 		strvec_push(&transport_ls_refs_options.ref_prefixes,
 			    "refs/tags/");
 
-	if (do_set_head)
+	if (follow_remote_head != FOLLOW_REMOTE_NEVER)
 		strvec_push(&transport_ls_refs_options.ref_prefixes,
 			    "HEAD");
 
@@ -2110,6 +2136,8 @@ static int do_fetch(struct transport *transport,
 
 	commit_fetch_head(&fetch_head);
 
+	collect_updated_tips(updated_tips, ref_map);
+
 	if (set_upstream) {
 		struct branch *branch = branch_get("HEAD");
 		struct ref *rm;
@@ -2163,7 +2191,7 @@ static int do_fetch(struct transport *transport,
 				  "you need to specify exactly one branch with the --set-upstream option"));
 		}
 	}
-	if (do_set_head) {
+	if (follow_remote_head != FOLLOW_REMOTE_NEVER) {
 		/*
 		 * Way too many cases where this can go wrong so let's just
 		 * ignore errors and fail silently for now.
@@ -2426,9 +2454,10 @@ static inline void fetch_one_setup_partial(struct remote *remote,
 static int fetch_one(struct remote *remote, int argc, const char **argv,
 		     int prune_tags_ok, int use_stdin_refspecs,
 		     const struct fetch_config *config,
-		     struct list_objects_filter_options *filter_options)
+		     struct list_objects_filter_options *filter_options,
+		     struct oidset *updated_tips)
 {
-	struct refspec rs = REFSPEC_INIT_FETCH;
+	struct refspec rs = REFSPEC_INIT_FETCH(the_hash_algo);
 	int i;
 	int exit_code;
 	int maybe_prune_tags;
@@ -2493,7 +2522,8 @@ static int fetch_one(struct remote *remote, int argc, const char **argv,
 	sigchain_push_common(unlock_pack_on_signal);
 	atexit(unlock_pack_atexit);
 	sigchain_push(SIGPIPE, SIG_IGN);
-	exit_code = do_fetch(gtransport, &rs, config, filter_options);
+	exit_code = do_fetch(gtransport, &rs, config, filter_options,
+			     updated_tips);
 	sigchain_pop(SIGPIPE);
 	refspec_clear(&rs);
 	transport_disconnect(gtransport);
@@ -2508,7 +2538,8 @@ int cmd_fetch(int argc,
 {
 	struct fetch_config config = {
 		.display_format = DISPLAY_FORMAT_FULL,
-		.follow_remote_head = FOLLOW_REMOTE_UNCONFIGURED,
+		.follow_remote_head_raw = NULL,
+		.follow_remote_head_seen = 0,
 		.prune = -1,
 		.prune_tags = -1,
 		.show_forced_updates = 1,
@@ -2534,6 +2565,12 @@ int cmd_fetch(int argc,
 	int negotiate_only = 0;
 	int porcelain = 0;
 	int i;
+	enum {
+		GRAPH_WRITE_REACHABLE,
+		GRAPH_WRITE_TIPS,
+		GRAPH_WRITE_SKIP,
+	} graph_write_mode = GRAPH_WRITE_REACHABLE;
+	struct oidset updated_tips = OIDSET_INIT;
 
 	struct option builtin_fetch_options[] = {
 		OPT__VERBOSITY(&verbosity),
@@ -2630,6 +2667,8 @@ int cmd_fetch(int argc,
 
 	filter_options.allow_auto_filter = 1;
 
+	refspec_init_fetch(&refmap, the_hash_algo);
+
 	packet_trace_identity("fetch");
 
 	/* Record the command line for the reflog */
@@ -2678,7 +2717,7 @@ int cmd_fetch(int argc,
 		int *rs = config.recurse_submodules == RECURSE_SUBMODULES_DEFAULT
 			  ? &config.recurse_submodules : NULL;
 
-		fetch_config_from_gitmodules(sfjc, rs);
+		fetch_config_from_gitmodules(the_repository, sfjc, rs);
 	}
 
 
@@ -2819,7 +2858,13 @@ int cmd_fetch(int argc,
 		}
 		trace2_region_enter("fetch", "fetch-one", the_repository);
 		result = fetch_one(remote, argc, argv, prune_tags_ok, stdin_refspecs,
-				   &config, &filter_options);
+				   &config, &filter_options, &updated_tips);
+		if (prepare_commit_graph(the_repository)) {
+			if (oidset_size(&updated_tips))
+				graph_write_mode = GRAPH_WRITE_TIPS;
+			else
+				graph_write_mode = GRAPH_WRITE_SKIP;
+		}
 		trace2_region_leave("fetch", "fetch-one", the_repository);
 	} else {
 		int max_children = max_jobs;
@@ -2896,11 +2941,23 @@ int cmd_fetch(int argc,
 		if (progress)
 			commit_graph_flags |= COMMIT_GRAPH_WRITE_PROGRESS;
 
-		trace2_region_enter("fetch", "write-commit-graph", the_repository);
-		write_commit_graph_reachable(the_repository->objects->sources,
-					     commit_graph_flags,
-					     NULL);
-		trace2_region_leave("fetch", "write-commit-graph", the_repository);
+		if (graph_write_mode != GRAPH_WRITE_SKIP) {
+			trace2_region_enter("fetch", "write-commit-graph",
+					    the_repository);
+			if (graph_write_mode == GRAPH_WRITE_TIPS)
+				write_commit_graph(
+					the_repository,
+					the_repository->objects->source->path,
+					NULL, &updated_tips,
+					commit_graph_flags, NULL);
+			else
+				write_commit_graph_reachable(
+					the_repository,
+					the_repository->objects->source->path,
+					commit_graph_flags, NULL);
+			trace2_region_leave("fetch", "write-commit-graph",
+					    the_repository);
+		}
 	}
 
 	if (enable_auto_gc) {
@@ -2924,7 +2981,9 @@ int cmd_fetch(int argc,
 	}
 
  cleanup:
+	oidset_clear(&updated_tips);
 	string_list_clear(&list, 0);
 	list_objects_filter_release(&filter_options);
+	free(config.follow_remote_head_raw);
 	return result;
 }

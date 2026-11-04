@@ -36,6 +36,7 @@ struct repo_path_cache {
 	char *merge_head;
 	char *fetch_head;
 	char *shallow;
+	char *merge_labels;
 };
 
 struct repository {
@@ -51,6 +52,14 @@ struct repository {
 	 * Cannot be NULL after initialization.
 	 */
 	char *commondir;
+
+	/*
+	 * The "prefix", a path to the current working directory relative to
+	 * the work tree root, or NULL, if the current working directory is not
+	 * a strict subdirectory of the work tree root. The prefix always ends
+	 * with a '/' character.
+	 */
+	char *prefix;
 
 	/*
 	 * Holds any information related to accessing the raw object content.
@@ -159,7 +168,7 @@ struct repository {
 	/* Repository's compatibility hash algorithm. */
 	const struct git_hash_algo *compat_hash_algo;
 
-	/* Repository's config values parsed by git_default_config() */
+	/* Repository-specific configuration values. */
 	struct repo_config_values config_values_private_;
 
 	/* Repository's reference storage format, as serialized on disk. */
@@ -175,6 +184,18 @@ struct repository {
 
 	/* True if commit-graph has been disabled within this process. */
 	int commit_graph_disabled;
+
+	/*
+	 * Indicates whether the rerere-cache has been enabled. -1 (the default
+	 * value) causes us to perform auto-detection via ".git/rr-cache".
+	 */
+	int rerere_cache_enabled;
+
+	/*
+	 * Controls whether the repository should lazily fetch missing
+	 * objects from promisor remotes. Defaults to 1.
+	 */
+	int fetch_if_missing;
 
 	/*
 	 * Lazily-populated cache mapping hook event names to configured hooks.
@@ -244,6 +265,7 @@ void repo_set_ref_storage_format(struct repository *repo,
 void initialize_repository(struct repository *repo);
 RESULT_MUST_BE_USED
 int repo_init(struct repository *r, const char *gitdir, const char *worktree);
+void repo_clear(struct repository *repo);
 
 /*
  * Initialize the repository 'subrepo' as the submodule at the given path. If
@@ -259,7 +281,6 @@ int repo_submodule_init(struct repository *subrepo,
 			struct repository *superproject,
 			const char *path,
 			const struct object_id *treeish_name);
-void repo_clear(struct repository *repo);
 
 /*
  * Populates the repository's index from its index_file, an index struct will

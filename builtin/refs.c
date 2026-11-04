@@ -10,7 +10,7 @@
 #include "refs/refs-internal.h"
 
 #define REFS_MIGRATE_USAGE \
-	N_("git refs migrate --ref-format=<format> [--no-reflog] [--dry-run]")
+	N_("git refs migrate --ref-storage-format=<format> [--no-reflog] [--dry-run]")
 
 #define REFS_VERIFY_USAGE \
 	N_("git refs verify [--strict] [--verbose]")
@@ -44,9 +44,10 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 	enum ref_storage_format format;
 	unsigned int flags = 0;
 	struct option options[] = {
-		OPT_STRING_F(0, "ref-format", &format_str, N_("format"),
-			N_("specify the reference format to convert to"),
+		OPT_STRING_F(0, "ref-storage-format", &format_str, N_("format"),
+			N_("specify the reference storage format to convert to"),
 			PARSE_OPT_NONEG),
+		OPT_ALIAS_F(0, "ref-format", "ref-storage-format", PARSE_OPT_HIDDEN),
 		OPT_BIT(0, "dry-run", &flags,
 			N_("perform a non-destructive dry-run"),
 			REPO_MIGRATE_REF_STORAGE_FORMAT_DRYRUN),
@@ -62,7 +63,7 @@ static int cmd_refs_migrate(int argc, const char **argv, const char *prefix,
 	if (argc)
 		usage(_("too many arguments"));
 	if (!format_str)
-		usage(_("missing --ref-format=<format>"));
+		usage(_("missing --ref-storage-format=<format>"));
 
 	format = ref_storage_format_by_name(format_str);
 	if (format == REF_STORAGE_FORMAT_UNKNOWN) {
@@ -113,7 +114,7 @@ static int cmd_refs_verify(int argc, const char **argv, const char *prefix,
 	repo_config(repo, git_fsck_config, &fsck_refs_options);
 	prepare_repo_settings(repo);
 
-	worktrees = get_worktrees_without_reading_head();
+	worktrees = get_worktrees_without_reading_head(repo);
 	for (size_t i = 0; worktrees[i]; i++)
 		ret |= refs_fsck(get_worktree_ref_store(worktrees[i]),
 				 &fsck_refs_options, worktrees[i]);
@@ -382,9 +383,9 @@ int cmd_refs(int argc,
 	const char * const refs_usage[] = {
 		REFS_MIGRATE_USAGE,
 		REFS_VERIFY_USAGE,
+		REFS_OPTIMIZE_USAGE,
 		"git refs list " COMMON_USAGE_FOR_EACH_REF,
 		REFS_EXISTS_USAGE,
-		REFS_OPTIMIZE_USAGE,
 		REFS_CREATE_USAGE,
 		REFS_DELETE_USAGE,
 		REFS_UPDATE_USAGE,
@@ -393,15 +394,27 @@ int cmd_refs(int argc,
 	};
 	parse_opt_subcommand_fn *fn = NULL;
 	struct option opts[] = {
-		OPT_SUBCOMMAND("migrate", &fn, cmd_refs_migrate),
-		OPT_SUBCOMMAND("verify", &fn, cmd_refs_verify),
-		OPT_SUBCOMMAND("list", &fn, cmd_refs_list),
-		OPT_SUBCOMMAND("exists", &fn, cmd_refs_exists),
-		OPT_SUBCOMMAND("optimize", &fn, cmd_refs_optimize),
-		OPT_SUBCOMMAND("create", &fn, cmd_refs_create),
-		OPT_SUBCOMMAND("delete", &fn, cmd_refs_delete),
-		OPT_SUBCOMMAND("update", &fn, cmd_refs_update),
-		OPT_SUBCOMMAND("rename", &fn, cmd_refs_rename),
+		OPT_GROUP(N_("Reference database")),
+		OPT_SUBCOMMAND_F("migrate", &fn, cmd_refs_migrate,
+				 N_("migrate the reference database to a different format"), 0),
+		OPT_SUBCOMMAND_F("verify", &fn, cmd_refs_verify,
+				 N_("verify the consistency of the reference database"), 0),
+		OPT_SUBCOMMAND_F("optimize", &fn, cmd_refs_optimize,
+				 N_("optimize the reference database"), 0),
+		OPT_GROUP(N_("Reading references")),
+		OPT_SUBCOMMAND_F("list", &fn, cmd_refs_list,
+				 N_("list references"), 0),
+		OPT_SUBCOMMAND_F("exists", &fn, cmd_refs_exists,
+				 N_("check whether a reference exists"), 0),
+		OPT_GROUP(N_("Writing references")),
+		OPT_SUBCOMMAND_F("create", &fn, cmd_refs_create,
+				 N_("create a new reference"), 0),
+		OPT_SUBCOMMAND_F("delete", &fn, cmd_refs_delete,
+				 N_("delete a reference"), 0),
+		OPT_SUBCOMMAND_F("update", &fn, cmd_refs_update,
+				 N_("update an existing reference"), 0),
+		OPT_SUBCOMMAND_F("rename", &fn, cmd_refs_rename,
+				 N_("rename a reference"), 0),
 		OPT_END(),
 	};
 

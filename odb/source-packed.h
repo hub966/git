@@ -42,6 +42,13 @@ struct odb_source_packed {
 	struct strmap packs_by_path;
 
 	/*
+	 * Whether this store is part of the local object directory of the
+	 * owning repository. Packfiles loaded via this store inherit this
+	 * flag via `pack_local`. Stores for alternates are not local.
+	 */
+	bool local;
+
+	/*
 	 * Whether packfiles have already been populated with this store's
 	 * packs.
 	 */
@@ -78,7 +85,9 @@ struct odb_source_packed *odb_source_packed_new(struct object_database *odb,
 static inline struct odb_source_packed *odb_source_packed_downcast(struct odb_source *source)
 {
 	if (source->type != ODB_SOURCE_PACKED)
-		BUG("trying to downcast source of type '%d' to packed", source->type);
+		BUG("trying to downcast source of type '%s' to '%s'",
+		    odb_source_type_to_name(source->type),
+		    odb_source_type_to_name(ODB_SOURCE_PACKED));
 	return container_of(source, struct odb_source_packed, base);
 }
 

@@ -2,80 +2,138 @@
 #include "abspath.h"
 #include "chdir-notify.h"
 #include "dir.h"
+#include "gettext.h"
+#include "fsck.h"
 #include "git-zlib.h"
+#include "hex.h"
+#include "list-objects-filter-options.h"
 #include "mergesort.h"
 #include "midx.h"
 #include "odb/source-packed.h"
 #include "odb/streaming.h"
+#include "pack.h"
+#include "pack-revindex.h"
 #include "packfile.h"
+#include "pack-bitmap.h"
+#include "strbuf.h"
+#include "progress.h"
+#include "run-command.h"
 
 static int find_pack_entry(struct odb_source_packed *store,
 			   const struct object_id *oid,
-			   struct pack_entry *e)
+			   struct pack_entry *e,
+			   enum object_info_flags flags,
+			   struct packed_git **bad_pack)
 {
 	struct packfile_list_entry *l;
+	enum midx_fill_result midx_result = MIDX_FILL_MISS;
 
 	odb_source_prepare(&store->base, 0);
-	if (store->midx && fill_midx_entry(store->midx, oid, e))
-		return 1;
+	if (store->midx) {
+		midx_result = midx_fill_entry(store->midx, oid, e, bad_pack);
+		if (midx_result == MIDX_FILL_HIT)
+			return 1;
+	}
 
 	for (l = store->packs.head; l; l = l->next) {
 		struct packed_git *p = l->pack;
 
-		if (!p->multi_pack_index && packfile_fill_entry(p, oid, e)) {
+		if (!p->multi_pack_index && packfile_fill_entry(p, oid, e, bad_pack)) {
 			if (!store->skip_mru_updates)
 				packfile_list_prepend(&store->packs, p);
 			return 1;
 		}
 	}
 
-	return 0;
-}
-
-static int odb_source_packed_read_object_info(struct odb_source *source,
-					      const struct object_id *oid,
-					      struct object_info *oi,
-					      enum object_info_flags flags)
-{
-	struct odb_source_packed *packed = odb_source_packed_downcast(source);
-	struct pack_entry e;
-	int ret;
-
 	/*
-	 * In case the first read didn't surface the object, we have to reload
-	 * packfiles. This may cause us to discover new packfiles that have
-	 * been added since the last time we have prepared the packfile store.
+	 * Recovery for a concurrent-repack race: a stale MIDX may still name a
+	 * vanished owning pack even though the object survives in another pack
+	 * the same MIDX covers.  The regular fallback above skips MIDX-covered
+	 * packs, and repreparing the on-disk pack set does not reload the
+	 * borrowed, cached MIDX, so scan its packs directly for the survivor.
+	 *
+	 * Skip the scan for quick lookups, which are expected to accept false
+	 * negatives in favor of speed.
 	 */
-	if (flags & OBJECT_INFO_SECOND_READ)
-		odb_source_prepare(source, ODB_PREPARE_FLUSH_CACHES);
+	if (midx_result == MIDX_FILL_OWNER_UNAVAILABLE &&
+	    !(flags & OBJECT_INFO_QUICK)) {
+		struct multi_pack_index *m = store->midx;
+		uint32_t i;
 
-	if (!find_pack_entry(packed, oid, &e))
-		return 1;
+		for (i = 0; i < m->num_packs + m->num_packs_in_base; i++) {
+			struct packed_git *p;
 
-	/*
-	 * We know that the caller doesn't actually need the
-	 * information below, so return early.
-	 */
-	if (!oi)
-		return 0;
-
-	ret = packed_object_info(packed, e.p, e.offset, oi);
-	if (ret < 0) {
-		mark_bad_packed_object(e.p, oid);
-		return -1;
+			if (prepare_midx_pack(m, i))
+				continue;
+			p = nth_midxed_pack(m, i);
+			if (p && packfile_fill_entry(p, oid, e, bad_pack))
+				return 1;
+		}
 	}
 
 	return 0;
 }
 
-static int odb_source_packed_read_object_stream(struct odb_read_stream **out,
+static enum odb_read_status odb_source_packed_read_object_info(struct odb_source *source,
+							       const struct object_id *oid,
+							       struct object_info *oi,
+							       enum object_info_flags flags,
+							       struct strbuf *errmsg)
+{
+	struct odb_source_packed *packed = odb_source_packed_downcast(source);
+	struct packed_git *bad_pack = NULL;
+	struct pack_entry e;
+	int ret;
+
+	if (!find_pack_entry(packed, oid, &e, flags, &bad_pack)) {
+		/*
+		 * The lookup may have failed because the object is known to be
+		 * corrupt in one of the packfiles. Report the object as
+		 * corrupt instead of missing in that case.
+		 */
+		if (bad_pack) {
+			ret = -1;
+			goto out;
+		}
+
+		ret = ODB_READ_NOT_FOUND;
+		goto out;
+	}
+
+	/*
+	 * We know that the caller doesn't actually need the
+	 * information below, so return early.
+	 */
+	if (!oi) {
+		ret = 0;
+		goto out;
+	}
+
+	ret = packed_object_info(packed, e.p, e.offset, oi);
+	if (ret < 0) {
+		bad_pack = e.p;
+		mark_bad_packed_object(e.p, oid);
+		goto out;
+	}
+
+	ret = 0;
+
+out:
+	if (ret < 0 && bad_pack && errmsg)
+		strbuf_addf(errmsg, _("packed object %s (stored in %s) is corrupt"),
+			    oid_to_hex(oid), bad_pack->pack_name);
+
+	return ret;
+}
+
+static int odb_source_packed_read_object_stream(struct odb_stream **out,
 						struct odb_source *source,
 						const struct object_id *oid)
 {
 	struct odb_source_packed *packed = odb_source_packed_downcast(source);
 	struct pack_entry e;
 
-	if (!find_pack_entry(packed, oid, &e))
+	if (!find_pack_entry(packed, oid, &e, 0, NULL))
 		return -1;
 
 	return packfile_read_object_stream(out, oid, e.p, e.offset);
@@ -143,7 +201,7 @@ static bool should_exclude_pack(struct packed_git *p, enum odb_for_each_object_f
 }
 
 static int for_each_prefixed_object_in_midx(
-	struct odb_source_packed *store,
+	struct odb_source_packed *source,
 	struct multi_pack_index *m,
 	const struct odb_for_each_object_options *opts,
 	struct odb_source_packed_for_each_object_wrapper_data *data)
@@ -170,6 +228,7 @@ static int for_each_prefixed_object_in_midx(
 		 */
 		for (i = first; i < num; i++) {
 			const struct object_id *current = NULL;
+			struct packed_git *pack;
 			struct object_id oid;
 
 			current = nth_midxed_object_oid(&oid, m, i);
@@ -177,9 +236,8 @@ static int for_each_prefixed_object_in_midx(
 			if (!match_hash(len, opts->prefix->hash, current->hash))
 				break;
 
-			if (opts->flags) {
+			if (opts->flags || data->request) {
 				uint32_t pack_id = nth_midxed_pack_int_id(m, i);
-				struct packed_git *pack;
 
 				if (prepare_midx_pack(m, pack_id)) {
 					pack_errors = true;
@@ -193,9 +251,9 @@ static int for_each_prefixed_object_in_midx(
 
 			if (data->request) {
 				struct object_info oi = *data->request;
+				off_t offset = nth_midxed_offset(m, i);
 
-				ret = odb_source_read_object_info(&store->base, current,
-								  &oi, 0);
+				ret = packed_object_info(source, pack, offset, &oi);
 				if (ret)
 					goto out;
 
@@ -219,7 +277,7 @@ out:
 }
 
 static int for_each_prefixed_object_in_pack(
-	struct odb_source_packed *store,
+	struct odb_source_packed *source,
 	struct packed_git *p,
 	const struct odb_for_each_object_options *opts,
 	struct odb_source_packed_for_each_object_wrapper_data *data)
@@ -246,8 +304,9 @@ static int for_each_prefixed_object_in_pack(
 
 		if (data->request) {
 			struct object_info oi = *data->request;
+			off_t offset = nth_packed_object_offset(p, i);
 
-			ret = odb_source_read_object_info(&store->base, &oid, &oi, 0);
+			ret = packed_object_info(source, p, offset, &oi);
 			if (ret)
 				goto out;
 
@@ -314,6 +373,37 @@ out:
 	return ret;
 }
 
+struct bitmapped_for_each_object_data {
+	struct odb_source_packed *packed;
+	const struct object_info *request;
+	const struct odb_for_each_object_options *opts;
+	odb_for_each_object_cb cb;
+	void *cb_data;
+};
+
+static int bitmapped_for_each_object(const struct object_id *oid,
+				     enum object_type type UNUSED,
+				     int flags UNUSED,
+				     uint32_t hash UNUSED,
+				     struct packed_git *pack,
+				     off_t offset,
+				     void *cb_data)
+{
+	struct bitmapped_for_each_object_data *data = cb_data;
+
+	if (should_exclude_pack(pack, data->opts->flags))
+		return 0;
+
+	if (data->request) {
+		struct object_info oi = *data->request;
+		if (packed_object_info(data->packed, pack, offset, &oi) < 0)
+			return -1;
+		return data->cb(oid, &oi, data->cb_data);
+	}
+
+	return data->cb(oid, NULL, data->cb_data);
+}
+
 static int odb_source_packed_for_each_object(struct odb_source *source,
 					     const struct object_info *request,
 					     odb_for_each_object_cb cb,
@@ -327,11 +417,32 @@ static int odb_source_packed_for_each_object(struct odb_source *source,
 		.cb = cb,
 		.cb_data = cb_data,
 	};
+	struct bitmap_index *bitmap = NULL;
 	struct packfile_list_entry *e;
 	int pack_errors = 0, ret;
 
 	if (opts->prefix)
 		return odb_source_packed_for_each_prefixed_object(packed, opts, &data);
+
+	if (opts->filter &&
+	    opts->filter->choice != LOFC_DISABLED &&
+	    can_filter_bitmap(opts->filter))
+		bitmap = prepare_bitmap_git_for_source(packed);
+	if (bitmap) {
+		struct bitmapped_for_each_object_data bitmap_data = {
+			.packed = packed,
+			.request = request,
+			.opts = opts,
+			.cb = cb,
+			.cb_data = cb_data,
+		};
+
+		ret = for_each_bitmapped_object(bitmap, opts->filter,
+						bitmapped_for_each_object,
+						&bitmap_data);
+		if (ret)
+			goto out;
+	}
 
 	packed->skip_mru_updates = true;
 
@@ -339,6 +450,13 @@ static int odb_source_packed_for_each_object(struct odb_source *source,
 		struct packed_git *p = e->pack;
 
 		if (should_exclude_pack(p, opts->flags))
+			continue;
+
+		/*
+		 * Objects covered by the bitmap have already been yielded
+		 * above; skip them here to avoid duplicates.
+		 */
+		if (bitmap && bitmap_index_contains_pack(bitmap, p))
 			continue;
 
 		if (open_pack_index(p)) {
@@ -356,6 +474,7 @@ static int odb_source_packed_for_each_object(struct odb_source *source,
 
 out:
 	packed->skip_mru_updates = false;
+	free_bitmap_index(bitmap);
 
 	if (!ret && pack_errors)
 		ret = -1;
@@ -507,18 +626,26 @@ static int odb_source_packed_find_abbrev_len(struct odb_source *source,
 }
 
 static int odb_source_packed_freshen_object(struct odb_source *source,
-					    const struct object_id *oid)
+					    const struct object_id *oid,
+					    const time_t *mtime)
 {
 	struct odb_source_packed *packed = odb_source_packed_downcast(source);
+	struct utimbuf times, *timesp = NULL;
 	struct pack_entry e;
 
-	if (!find_pack_entry(packed, oid, &e))
+	if (mtime) {
+		times.actime = *mtime;
+		times.modtime = *mtime;
+		timesp = &times;
+	}
+
+	if (!find_pack_entry(packed, oid, &e, 0, NULL))
 		return 0;
 	if (e.p->is_cruft)
 		return 0;
 	if (e.p->freshened)
 		return 1;
-	if (utime(e.p->pack_name, NULL))
+	if (utime(e.p->pack_name, timesp))
 		return 0;
 	e.p->freshened = 1;
 
@@ -529,37 +656,26 @@ static int odb_source_packed_write_object(struct odb_source *source UNUSED,
 					  const void *buf UNUSED,
 					  size_t len UNUSED,
 					  enum object_type type UNUSED,
-					  struct object_id *oid UNUSED,
-					  struct object_id *compat_oid UNUSED,
+					  const struct object_id *oid UNUSED,
+					  const struct object_id *compat_oid UNUSED,
+					  const time_t *mtime UNUSED,
 					  unsigned flags UNUSED)
 {
 	return error("packed backend cannot write objects");
 }
 
 static int odb_source_packed_write_object_stream(struct odb_source *source UNUSED,
-						 struct odb_write_stream *stream UNUSED,
-						 size_t len UNUSED,
+						 struct odb_stream *stream UNUSED,
 						 struct object_id *oid UNUSED)
 {
 	return error("packed backend cannot write object streams");
 }
 
 static int odb_source_packed_begin_transaction(struct odb_source *source UNUSED,
-					       struct odb_transaction **out UNUSED)
+					       struct odb_transaction **out UNUSED,
+					       enum odb_transaction_flags flags UNUSED)
 {
 	return error("packed backend cannot begin transactions");
-}
-
-static int odb_source_packed_read_alternates(struct odb_source *source UNUSED,
-					     struct strvec *out UNUSED)
-{
-	return 0;
-}
-
-static int odb_source_packed_write_alternate(struct odb_source *source UNUSED,
-					     const char *alternate UNUSED)
-{
-	return error("packed backend cannot write alternates");
 }
 
 void (*report_garbage)(unsigned seen_bits, const char *path);
@@ -624,7 +740,7 @@ static void prepare_pack(const char *full_name, size_t full_name_len,
 	      midx_contains_pack(data->source->midx, file_name))) {
 		char *trimmed_path = xstrndup(full_name, full_name_len);
 		packfile_store_load_pack(data->source,
-					 trimmed_path, data->source->base.local);
+					 trimmed_path, data->source->local);
 		free(trimmed_path);
 	}
 
@@ -713,8 +829,7 @@ static void odb_source_packed_prepare(struct odb_source *source,
 	packed->initialized = true;
 }
 
-static void odb_source_packed_reparent(const char *name UNUSED,
-				       const char *old_cwd,
+static void odb_source_packed_reparent(const char *old_cwd,
 				       const char *new_cwd,
 				       void *cb_data)
 {
@@ -743,8 +858,9 @@ static void odb_source_packed_free(struct odb_source *source)
 {
 	struct odb_source_packed *packed = odb_source_packed_downcast(source);
 
-	chdir_notify_unregister(NULL, odb_source_packed_reparent, packed);
+	chdir_notify_unregister(odb_source_packed_reparent, packed);
 
+	odb_source_close(source);
 	for (struct packfile_list_entry *e = packed->packs.head; e; e = e->next)
 		free(e->pack);
 	packfile_list_clear(&packed->packs);
@@ -754,6 +870,117 @@ static void odb_source_packed_free(struct odb_source *source)
 	free(packed);
 }
 
+static int verify_packs(struct odb_source_packed *source,
+			struct odb_fsck_options *opts)
+{
+	struct progress *progress = NULL;
+	struct packfile_list_entry *e;
+	uint32_t total = 0, count = 0;
+	int ret = 0;
+
+	if (opts->flags & ODB_FSCK_PROGRESS) {
+		for (e = packfile_store_get_packs(source); e; e = e->next) {
+			if (open_pack_index(e->pack))
+				continue;
+			total += e->pack->num_objects;
+		}
+
+		progress = start_progress(source->base.odb->repo,
+					  _("Checking objects"), total);
+	}
+
+	for (e = packfile_store_get_packs(source); e; e = e->next) {
+		/* verify gives error messages itself */
+		if (verify_pack(source->base.odb->repo, e->pack,
+				opts->object_cb, opts->object_payload,
+				progress, count))
+			ret = -1;
+		count += e->pack->num_objects;
+	}
+	stop_progress(&progress);
+
+	return ret;
+}
+
+static int verify_reverse_indices(struct odb_source_packed *source,
+				  struct odb_fsck_options *opts)
+{
+	struct progress *progress = NULL;
+	struct packfile_list_entry *e;
+	uint32_t pack_count = 0;
+	int res = 0;
+
+	if (opts->flags & ODB_FSCK_PROGRESS) {
+		for (e = packfile_store_get_packs(source); e; e = e->next)
+			pack_count++;
+		progress = start_delayed_progress(source->base.odb->repo,
+						  "Verifying reverse pack-indexes", pack_count);
+		pack_count = 0;
+	}
+
+	for (e = packfile_store_get_packs(source); e; e = e->next) {
+		int load_error = load_pack_revindex_from_disk(e->pack);
+
+		if (load_error < 0) {
+			error(_("unable to load rev-index for pack '%s'"), e->pack->pack_name);
+			res = -1;
+		} else if (!load_error &&
+			   !load_pack_revindex(source->base.odb->repo, e->pack) &&
+			   verify_pack_revindex(e->pack)) {
+			error(_("invalid rev-index for pack '%s'"), e->pack->pack_name);
+			res = -1;
+		}
+		display_progress(progress, ++pack_count);
+	}
+	stop_progress(&progress);
+
+	return res;
+}
+
+static int verify_midx(struct odb_source_packed *source,
+		       struct odb_fsck_options *opts)
+{
+	struct child_process midx_verify = CHILD_PROCESS_INIT;
+
+	prepare_repo_settings(source->base.odb->repo);
+	if (!source->base.odb->repo->settings.core_multi_pack_index)
+		return 0;
+
+	child_process_init(&midx_verify);
+	midx_verify.git_cmd = 1;
+	strvec_pushl(&midx_verify.args, "multi-pack-index",
+		     "verify", "--object-dir", source->base.path, NULL);
+	if (opts->flags & ODB_FSCK_PROGRESS)
+		strvec_push(&midx_verify.args, "--progress");
+	else
+		strvec_push(&midx_verify.args, "--no-progress");
+	if (run_command(&midx_verify))
+		return -1;
+
+	return 0;
+}
+
+static int odb_source_packed_fsck(struct odb_source *source,
+				  struct odb_fsck_options *opts)
+{
+	struct odb_source_packed *packed = odb_source_packed_downcast(source);
+	int ret = 0;
+
+	if ((opts->flags & ODB_FSCK_FULL) && verify_packs(packed, opts) < 0)
+		ret = -1;
+
+	if (verify_reverse_indices(packed, opts) < 0)
+		ret = -1;
+
+	if (verify_bitmap_files(packed))
+		ret = -1;
+
+	if (verify_midx(packed, opts) < 0)
+		ret = -1;
+
+	return ret;
+}
+
 struct odb_source_packed *odb_source_packed_new(struct object_database *odb,
 						const char *path,
 						bool local)
@@ -761,12 +988,14 @@ struct odb_source_packed *odb_source_packed_new(struct object_database *odb,
 	struct odb_source_packed *packed;
 
 	CALLOC_ARRAY(packed, 1);
-	odb_source_init(&packed->base, odb, ODB_SOURCE_PACKED, path, local);
+	odb_source_init(&packed->base, odb, ODB_SOURCE_PACKED, path);
 	strmap_init(&packed->packs_by_path);
+	packed->local = local;
 
 	packed->base.free = odb_source_packed_free;
 	packed->base.close = odb_source_packed_close;
 	packed->base.prepare = odb_source_packed_prepare;
+	packed->base.fsck = odb_source_packed_fsck;
 	packed->base.read_object_info = odb_source_packed_read_object_info;
 	packed->base.read_object_stream = odb_source_packed_read_object_stream;
 	packed->base.for_each_object = odb_source_packed_for_each_object;
@@ -776,11 +1005,9 @@ struct odb_source_packed *odb_source_packed_new(struct object_database *odb,
 	packed->base.write_object = odb_source_packed_write_object;
 	packed->base.write_object_stream = odb_source_packed_write_object_stream;
 	packed->base.begin_transaction = odb_source_packed_begin_transaction;
-	packed->base.read_alternates = odb_source_packed_read_alternates;
-	packed->base.write_alternate = odb_source_packed_write_alternate;
 
 	if (!is_absolute_path(path))
-		chdir_notify_register(NULL, odb_source_packed_reparent, packed);
+		chdir_notify_register(odb_source_packed_reparent, packed);
 
 	return packed;
 }

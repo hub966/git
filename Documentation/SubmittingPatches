@@ -117,11 +117,25 @@ of review.
   can still continue to further improve them by adding more patches on
   top, but by the time a topic gets merged to 'next', it is expected
   that everybody agrees that the scope and the basic direction of the
-  topic are appropriate, so such an incremental updates are limited to
+  topic are appropriate, so such incremental updates are limited to
   small corrections and polishing.  After a topic cooks for some time
   (like 7 calendar days) in 'next' without needing further tweaks on
   top, it gets merged to the 'master' branch and waits to become part
   of the next major release.
+
+But sometimes things do not work as planned:
+
+. If a mailing list discussion convinces you that your changes aren't
+  ideal, please explicitly retract the topic to save the maintainer
+  time and effort.
+
+. If you must drop a topic due to shifting priorities, lack of time,
+  or other commitments, notify the list as a courtesy so others can
+  take over. Anyone can resurrect the topic later when they have the
+  capacity to do so.
+
+. Topics with unaddressed review comments that remain inactive for
+  four weeks may be discarded by the maintainer.
 
 In the following sections, many techniques and conventions are listed
 to help your patches get reviewed effectively in such a life cycle.

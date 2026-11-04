@@ -10,6 +10,7 @@
 #include "object-name.h"
 #include "parse-options.h"
 #include "refs.h"
+#include "stash.h"
 #include "lockfile.h"
 #include "cache-tree.h"
 #include "unpack-trees.h"
@@ -30,7 +31,6 @@
 #include "reflog.h"
 #include "reflog-walk.h"
 #include "add-interactive.h"
-#include "oid-array.h"
 #include "commit.h"
 
 #define INCLUDE_ALL_FILES 2
@@ -422,50 +422,6 @@ done:
 	return ret;
 }
 
-static int diff_tree_binary(struct strbuf *out, struct object_id *w_commit)
-{
-	struct child_process cp = CHILD_PROCESS_INIT;
-	const char *w_commit_hex = oid_to_hex(w_commit);
-
-	/*
-	 * Diff-tree would not be very hard to replace with a native function,
-	 * however it should be done together with apply_cached.
-	 */
-	cp.git_cmd = 1;
-	strvec_pushl(&cp.args, "diff-tree", "--binary", "--no-color", NULL);
-	strvec_pushf(&cp.args, "%s^2^..%s^2", w_commit_hex, w_commit_hex);
-
-	return pipe_command(&cp, NULL, 0, out, 0, NULL, 0);
-}
-
-static int apply_cached(struct strbuf *out)
-{
-	struct child_process cp = CHILD_PROCESS_INIT;
-
-	/*
-	 * Apply currently only reads either from stdin or a file, thus
-	 * apply_all_patches would have to be updated to optionally take a
-	 * buffer.
-	 */
-	cp.git_cmd = 1;
-	strvec_pushl(&cp.args, "apply", "--cached", NULL);
-	return pipe_command(&cp, out->buf, out->len, NULL, 0, NULL, 0);
-}
-
-static int reset_head(void)
-{
-	struct child_process cp = CHILD_PROCESS_INIT;
-
-	/*
-	 * Reset is overall quite simple, however there is no current public
-	 * API for resetting.
-	 */
-	cp.git_cmd = 1;
-	strvec_pushl(&cp.args, "reset", "--quiet", "--refresh", NULL);
-
-	return run_command(&cp);
-}
-
 static int is_path_a_directory(const char *path)
 {
 	/*
@@ -640,10 +596,12 @@ static void unstage_changes_unless_new(struct object_id *orig_tree)
 		die(_("could not write index"));
 }
 
-static int do_apply_stash(const char *prefix, struct stash_info *info,
-			  int index, int quiet,
-			  const char *label_ours, const char *label_theirs,
-			  const char *label_base)
+static enum stash_apply_result do_apply_stash(const char *prefix,
+					      struct stash_info *info,
+					      int index, int quiet,
+					      const char *label_ours,
+					      const char *label_theirs,
+					      const char *label_base)
 {
 	int clean, ret;
 	int has_index = index;
@@ -662,38 +620,42 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 				repo_get_index_file(the_repository), 0, NULL))
 		return error(_("cannot apply a stash in the middle of a merge"));
 
+	init_ui_merge_options(&o, the_repository);
+
+	if (quiet)
+		o.verbosity = 0;
+
 	if (index) {
 		if (oideq(&info->b_tree, &info->i_tree) ||
 		    oideq(&c_tree, &info->i_tree)) {
 			has_index = 0;
 		} else {
-			struct strbuf out = STRBUF_INIT;
+			struct merge_result result = { 0 };
 
-			if (diff_tree_binary(&out, &info->w_commit)) {
-				strbuf_release(&out);
-				return error(_("could not generate diff %s^!."),
-					     oid_to_hex(&info->w_commit));
-			}
+			o.branch1 = "Current index";
+			o.branch2 = "Stashed index changes";
+			o.ancestor = "Stash base";
 
-			ret = apply_cached(&out);
-			strbuf_release(&out);
-			if (ret)
+			head = lookup_tree(o.repo, &c_tree);
+			merge = lookup_tree(o.repo, &info->i_tree);
+			merge_base = lookup_tree(o.repo, &info->b_tree);
+
+			merge_incore_nonrecursive(&o, merge_base, head, merge,
+						  &result);
+
+			if (result.clean < 0) {
+				merge_finalize(&o, &result);
+				return error(_("index merge failed"));
+			} else if (!result.clean) {
+				merge_finalize(&o, &result);
 				return error(_("conflicts in index. "
 					       "Try without --index."));
-
-			discard_index(the_repository->index);
-			repo_read_index(the_repository);
-			if (write_index_as_tree(&index_tree, the_repository->index,
-						repo_get_index_file(the_repository), 0, NULL))
-				return error(_("could not save index tree"));
-
-			reset_head();
-			discard_index(the_repository->index);
-			repo_read_index(the_repository);
+			} else {
+				oidcpy(&index_tree, &result.tree->object.oid);
+				merge_finalize(&o, &result);
+			}
 		}
 	}
-
-	init_ui_merge_options(&o, the_repository);
 
 	o.branch1 = label_ours ? label_ours : "Updated upstream";
 	o.branch2 = label_theirs ? label_theirs : "Stashed changes";
@@ -701,9 +663,6 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 
 	if (oideq(&info->b_tree, &c_tree))
 		o.branch1 = "Version stash was based on";
-
-	if (quiet)
-		o.verbosity = 0;
 
 	if (o.verbosity >= 3)
 		printf_ln(_("Merging %s with %s"), o.branch1, o.branch2);
@@ -717,8 +676,8 @@ static int do_apply_stash(const char *prefix, struct stash_info *info,
 
 	/*
 	 * If 'clean' >= 0, reverse the value for 'ret' so 'ret' is 0 when the
-	 * merge was clean, and nonzero if the merge was unclean or encountered
-	 * an error.
+	 * merge was clean, and 1 if the merge was unclean or a negative value
+	 * if it encountered an error.
 	 */
 	ret = clean >= 0 ? !clean : clean;
 
@@ -1702,8 +1661,8 @@ static int do_push_stash(const struct pathspec *ps, const char *stash_msg, int q
 	if (!include_untracked && ps->nr) {
 		char *ps_matched = xcalloc(ps->nr, 1);
 
-		/* TODO: audit for interaction with sparse-index. */
-		ensure_full_index(the_repository->index);
+		if (pathspec_needs_expanded_index(the_repository->index, ps))
+			ensure_full_index(the_repository->index);
 		for (size_t i = 0; i < the_repository->index->cache_nr; i++)
 			ce_path_match(the_repository->index, the_repository->index->cache[i], ps,
 				      ps_matched);
@@ -1929,7 +1888,7 @@ static int push_stash(int argc, const char **argv, const char *prefix,
 		OPT_BOOL('u', "include-untracked", &include_untracked,
 			 N_("include untracked files in stash")),
 		OPT_SET_INT('a', "all", &include_untracked,
-			    N_("include ignore files"), 2),
+			    N_("include ignore files"), INCLUDE_ALL_FILES),
 		OPT_STRING('m', "message", &stash_msg, N_("message"),
 			   N_("stash message")),
 		OPT_PATHSPEC_FROM_FILE(&pathspec_from_file),
@@ -2036,7 +1995,7 @@ static int save_stash(int argc, const char **argv, const char *prefix,
 		OPT_BOOL('u', "include-untracked", &include_untracked,
 			 N_("include untracked files in stash")),
 		OPT_SET_INT('a', "all", &include_untracked,
-			    N_("include ignore files"), 2),
+			    N_("include ignore files"), INCLUDE_ALL_FILES),
 		OPT_STRING('m', "message", &stash_msg, "message",
 			   N_("stash message")),
 		OPT_END()
@@ -2472,7 +2431,7 @@ int cmd_stash(int argc,
 		OPT_SUBCOMMAND("push", &fn, push_stash_unassumed),
 		OPT_SUBCOMMAND("export", &fn, export_stash),
 		OPT_SUBCOMMAND("import", &fn, import_stash),
-		OPT_SUBCOMMAND_F("save", &fn, save_stash, PARSE_OPT_NOCOMPLETE),
+		OPT_SUBCOMMAND_F("save", &fn, save_stash, NULL, PARSE_OPT_NOCOMPLETE),
 		OPT_END()
 	};
 	const char **args_copy;
@@ -2492,10 +2451,22 @@ int cmd_stash(int argc,
 	strbuf_addf(&stash_index_path, "%s.stash.%" PRIuMAX, index_file,
 		    (uintmax_t)pid);
 
-	if (fn)
-		return !!fn(argc, argv, prefix, repo);
-	else if (!argc)
+	if (fn) {
+		ret = fn(argc, argv, prefix, repo);
+
+		/*
+		 * The subcommand implementations return 0 on success, a
+		 * negative value on failure, and STASH_APPLY_CONFLICT
+		 * when applying a stash entry resulted in conflicts.
+		 * Map failures to 128, the status die() uses, so that
+		 * exit status 1 unambiguously indicates conflicts.
+		 */
+		if (ret < 0)
+			return 128;
+		return ret;
+	} else if (!argc) {
 		return !!push_stash_unassumed(0, NULL, prefix, repo);
+	}
 
 	/* Assume 'stash push' */
 	strvec_push(&args, "push");
